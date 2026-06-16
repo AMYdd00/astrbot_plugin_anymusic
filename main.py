@@ -244,7 +244,7 @@ class MusicSharePlugin(Star):
         download_dir = Path(StarTools.get_data_dir("music_share")) / "downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        audio_file = await self.downloader.search_and_download(
+        audio_file, error_msg = await self.downloader.search_and_download(
             title, artist,
             expected_duration=expected_duration,
             match_threshold=self.config_helper.match_threshold(),
@@ -252,7 +252,7 @@ class MusicSharePlugin(Star):
         )
 
         if not audio_file:
-            yield event.plain_result(f"未找到匹配的歌曲: {title} {artist}".strip())
+            yield event.plain_result(error_msg or f"未找到匹配的歌曲: {title} {artist}".strip())
             return
 
         file_size_mb = audio_file.stat().st_size / (1024 * 1024)
