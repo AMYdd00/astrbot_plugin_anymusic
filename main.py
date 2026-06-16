@@ -54,10 +54,21 @@ class MusicSharePlugin(Star):
             song_name(string): 歌曲名称，最好包含艺术家名以提高搜索准确性，如 周杰伦 晴天
         '''
         logger.info(f"[MusicShare] LLM 点歌: '{song_name}'")
-        async for result in self._download_then_send(
-            event, song_name, "", expected_duration=""
-        ):
-            yield result
+
+        # Try to get cover art and send a card first
+        if info := await self._resolve_llm_song_info(song_name):
+            async for result in self._send_cover_card(event, info):
+                yield result
+            async for result in self._download_then_send(
+                event, info.title, info.artist,
+                expected_duration=info.duration or "",
+            ):
+                yield result
+        else:
+            async for result in self._download_then_send(
+                event, song_name, "", expected_duration=""
+            ):
+                yield result
 
     # ── Auto-detect music links ───────────────────────────────────────────
 
@@ -198,6 +209,43 @@ class MusicSharePlugin(Star):
         import sys
         try:
             return sys.executable
+        except Exception:
+            return None
+
+    async def _resolve_llm_song_info(self, song_name: str) -> Optional[SongInfo]:
+        """Quick metadata lookup via yt-dlp to get title/artist/cover for cards."""
+        try:
+            python_exe = self._find_python()
+            if not python_exe:
+                return None
+            cmd = [
+                python_exe, "-m", "yt_dlp",
+                f"ytsearch1:{song_name}",
+                "--dump-json", "--skip-download",
+                "--quiet", "--no-playlist",
+                "--no-warnings",
+            ]
+            proxy = self.config_helper.proxy()
+            if proxy:
+                cmd.extend(["--proxy", proxy])
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=self.config_helper.search_timeout(),
+            )
+            if proc.returncode != 0:
+                return None
+            data = json.loads(stdout.decode("utf-8", errors="replace"))
+            return SongInfo(
+                title=data.get("title", song_name),
+                artist=data.get("uploader", "") or data.get("artist", "") or "",
+                cover_url=data.get("thumbnail", "") or "",
+                source="llm_search",
+            )
         except Exception:
             return None
 
