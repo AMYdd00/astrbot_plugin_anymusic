@@ -62,6 +62,13 @@
       "step": 1
     }
   },
+  "llm_tool_mode": {
+    "type": "string",
+    "description": "LLM 点歌时发送方式",
+    "hint": "当 LLM 调用 search_song 点歌时，可以选择仅发送语音+图片、仅语音、或者同时发送文件。",
+    "default": "图片+语音",
+    "options": ["仅语音", "图片+语音", "都发送"]
+  },
   "send_mode": {
     "type": "string",
     "description": "识别后发送方式",
@@ -74,5 +81,41 @@
     "description": "启用的群组",
     "hint": "仅在指定群组生效，留空则所有群组生效。填写群号，多个用逗号分隔",
     "default": []
+  },
+  "llm_search_enabled": {
+    "type": "bool",
+    "description": "启用 LLM 智能选歌",
+    "hint": "开启后，双引擎搜索结果会交由 LLM 二次分析，从候选中选出最匹配的版本，避免翻唱/原唱误匹配。",
+    "default": false
+  },
+  "llm_search_provider": {
+    "type": "string",
+    "description": "LLM 智能选歌提供商ID",
+    "hint": "指定用于选歌的 LLM 提供商ID（需在 AI 配置中已添加对应提供商），留空则使用当前会话默认提供商。",
+    "default": ""
+  },
+  "enable_voice_recognition": {
+    "type": "bool",
+    "description": "启用语音识歌",
+    "hint": "开启后，群内 @Bot 发送语音消息可自动识别歌曲并下载。需填写 ACRCloud 密钥，免费注册见 README。",
+    "default": false
+  },
+  "acrcloud_host": {
+    "type": "string",
+    "description": "ACRCloud Host 地址",
+    "hint": "如 identify-eu-west-1.acrcloud.com，根据账户区域选择（欧洲/亚洲）。",
+    "default": ""
+  },
+  "acrcloud_access_key": {
+    "type": "string",
+    "description": "ACRCloud Access Key",
+    "hint": "在 https://console.acrcloud.com 注册获取",
+    "default": ""
+  },
+  "acrcloud_access_secret": {
+    "type": "string",
+    "description": "ACRCloud Access Secret",
+    "hint": "在 https://console.acrcloud.com 注册获取",
+    "default": ""
   }
 }

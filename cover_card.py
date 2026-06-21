@@ -296,19 +296,30 @@ async def make_info_card(
     draw.text((badge_x, text_y), badge_text, font=font_badge, fill=BADGE_TEXT)
     y += badge_h + gap_big
 
-    # Title — centered
-    for line in _wrap_text(title, font_title, TEXT_MAX_W):
-        bb = font_title.getbbox(line)
+    # Title — auto-scale font if too long, max 2 lines
+    title_lines = _fit_text(title, font_title, TEXT_MAX_W, min_size=28, max_lines=2)
+    for line, line_font in title_lines:
+        bb = line_font.getbbox(line)
         lw = bb[2] - bb[0]
         cx = TEXT_X + (PANEL_W - lw) // 2
-        draw.text((cx, y), line, font=font_title, fill=TITLE_COLOR)
+        draw.text((cx, y), line, font=line_font, fill=TITLE_COLOR)
         y += title_line_h
 
     y += gap_big
 
-    # Artist
-    draw.text((TEXT_X + PAD_INNER, y), f"艺术家  {artist}", font=font_sub, fill=TEXT_COLOR)
-    y += sub_line_h + gap_big
+    # Artist — center, auto-scale font, truncate with ellipsis
+    artist_prefix = "艺术家  "
+    artist_full = artist_prefix + artist
+    artist_lines, artist_font = _fit_text(
+        artist_full, font_sub, TEXT_MAX_W, min_size=18, max_lines=2
+    )
+    for line, line_font in artist_lines:
+        bb = line_font.getbbox(line)
+        lw = bb[2] - bb[0]
+        cx = TEXT_X + (PANEL_W - lw) // 2
+        draw.text((cx, y), line, font=line_font, fill=TEXT_COLOR)
+        y += sub_line_h
+    y += gap_big
 
     # Metadata
     if album:
@@ -373,3 +384,63 @@ def _truncate(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> str:
     while text and font.getbbox(text + "...")[2] - font.getbbox(text + "...")[0] > max_w:
         text = text[:-1]
     return text + "..."
+
+
+def _fit_text(
+    text: str,
+    base_font: ImageFont.FreeTypeFont,
+    max_w: int,
+    min_size: int = 28,
+    max_lines: int = 2,
+) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+    """Fit text into max_lines by auto-scaling font size.
+
+    Returns list of (line_text, font) tuples.
+    If text still overflows at min_size, last visible line is truncated with "...".
+    """
+    current_size = base_font.size
+    bold = True  # title font is always bold
+
+    while current_size >= min_size:
+        font = _load_font(current_size, bold=bold)
+        lines = _wrap_text(text, font, max_w)
+        if len(lines) <= max_lines:
+            return [(line, font) for line in lines]
+        current_size -= 2
+
+    # At min_size, still too many lines → truncate to max_lines
+    font = _load_font(min_size, bold=bold)
+    lines = _wrap_text(text, font, max_w)
+    if len(lines) > max_lines:
+        # Keep first max_lines-1 full lines, truncate the last
+        visible = lines[: max_lines - 1]
+        last_line = _truncate(lines[max_lines - 1], font, max_w)
+        visible.append(last_line)
+        return [(line, font) for line in visible]
+    return [(line, font) for line in lines]
+
+
+def _fit_single_line(
+    text: str,
+    base_font: ImageFont.FreeTypeFont,
+    max_w: int,
+    min_size: int = 20,
+) -> str:
+    """Fit text to a single line by auto-scaling font, then truncating with "...".
+
+    Note: This modifies base_font in-place by reloading at smaller sizes.
+    Returns the fitted text string.
+    """
+    current_size = base_font.size
+    bold = True  # artist font is bold
+
+    while current_size >= min_size:
+        font = _load_font(current_size, bold=bold)
+        bbox = font.getbbox(text)
+        if bbox[2] - bbox[0] <= max_w:
+            return text
+        current_size -= 1
+
+    # At min_size, still too long → truncate with "..."
+    font = _load_font(min_size, bold=bold)
+    return _truncate(text, font, max_w)

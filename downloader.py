@@ -22,6 +22,7 @@ class MusicDownloader:
     async def search_and_download(
         self, title: str, artist: str,
         expected_duration: str, match_threshold: int, download_dir: Path,
+        llm_picker=None,
     ) -> Tuple[Optional[Path], str]:
         query = f"{title} {artist}".strip()
         query = re.sub(r'[<>|"&!$`]', "", query).strip()
@@ -39,14 +40,28 @@ class MusicDownloader:
                 return None, f"搜索失败: {err_detail}"
             return None, f"未搜到匹配结果: {query}"
 
-        best = self._pick_best(candidates, expected_secs, match_threshold, title)
+        if llm_picker is not None:
+            # LLM smart selection: let LLM pick the best match from candidates
+            best = await llm_picker(candidates, title, artist)
+            if best is None:
+                # LLM failed, fall back to scoring
+                best = self._pick_best(candidates, expected_secs, match_threshold, title)
+            else:
+                logger.info(
+                    f"[MusicShare] LLM Selected: {best.title!r} ({best.source}, "
+                    f"{best.duration}s)"
+                )
+        else:
+            best = self._pick_best(candidates, expected_secs, match_threshold, title)
+
         if best is None:
             return None, (f"未找到时长匹配的歌曲 (精度 {match_threshold}%, "
                          f"预期 {expected_secs}s)")
-        logger.info(
-            f"[MusicShare] Selected: {best.title!r} ({best.source}, "
-            f"{best.duration}s vs expected {expected_secs}s)"
-        )
+        if llm_picker is None:
+            logger.info(
+                f"[MusicShare] Selected: {best.title!r} ({best.source}, "
+                f"{best.duration}s vs expected {expected_secs}s)"
+            )
         filepath, dl_err = await self._download(best, download_dir)
         if not filepath:
             return None, dl_err or "下载失败"

@@ -12,7 +12,13 @@ from typing import Optional
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
-from astrbot.api.message_components import File, Image, Record, file_to_base64
+from astrbot.api.message_components import (
+    ComponentType,
+    File,
+    Image,
+    Record,
+    file_to_base64,
+)
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .config import ConfigHelper
@@ -29,7 +35,7 @@ from .utils import (
 )
 
 
-@register("astrbot_plugin_anymusic", "user", "AnyMusic", "1.0.0")
+@register("astrbot_plugin_anymusic", "user", "AnyMusic", "1.0.3")
 class MusicSharePlugin(Star):
     """Auto-detect music links & LLM song search tool."""
 
@@ -55,20 +61,29 @@ class MusicSharePlugin(Star):
         '''
         logger.info(f"[MusicShare] LLM 点歌: '{song_name}'")
 
-        # Try to get cover art and send a card first
-        if info := await self._resolve_llm_song_info(song_name):
+        # Get cover art for card (if mode includes image)
+        mode = self.config_helper.llm_tool_mode()
+        info = None
+        if mode != "仅语音":
+            info = await self._resolve_llm_song_info(song_name)
+
+        # Send cover card if image mode
+        if info and "图片" in mode:
             async for result in self._send_cover_card(event, info):
                 yield result
-            async for result in self._download_then_send(
-                event, info.title, info.artist,
-                expected_duration=info.duration or "",
-            ):
-                yield result
-        else:
-            async for result in self._download_then_send(
-                event, song_name, "", expected_duration=""
-            ):
-                yield result
+
+        # Download and send audio
+        # Use llm_tool_mode for sending: if 都发送, send both voice and file
+        song_title = info.title if info else song_name
+        song_artist = info.artist if info else ""
+        song_dur = info.duration if info else ""
+
+        async for result in self._download_then_send(
+            event, song_title, song_artist,
+            expected_duration=song_dur or "",
+            force_mode=(mode if mode == "都发送" else None),
+        ):
+            yield result
 
     # ── Auto-detect music links ───────────────────────────────────────────
 
@@ -82,6 +97,17 @@ class MusicSharePlugin(Star):
                 group_id = ""
             if group_id and not self.config_helper.is_group_enabled(group_id):
                 return
+
+        # ── Voice recognition: @bot + voice message ──
+        message_chain = event.get_message_chain()
+        has_record = any(c.type == ComponentType.Record for c in message_chain)
+        has_at = any(c.type == ComponentType.At for c in message_chain)
+
+        if has_record and has_at and self.config_helper.voice_recognition_enabled():
+            logger.info("[MusicShare] 检测到 @Bot + 语音消息，开始识歌")
+            async for result in self._handle_voice_recognition(event, message_chain):
+                yield result
+            return  # Don't continue to link parsing
 
         message_text = event.message_str or ""
         result = extract_music_url(message_text)
@@ -249,6 +275,172 @@ class MusicSharePlugin(Star):
         except Exception:
             return None
 
+    # ── LLM Smart Picker ──────────────────────────────────────────────────
+
+    def _create_llm_picker(self, event: AstrMessageEvent):
+        """Create a closure that uses LLM to pick the best candidate from search results."""
+        from .downloader import Candidate
+
+        async def llm_pick(candidates: list, title: str, artist: str):
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]
+
+            try:
+                provider_id = self.config_helper.llm_search_provider()
+                if not provider_id:
+                    umo = event.unified_msg_origin
+                    provider_id = await self.context.get_current_chat_provider_id(umo)
+
+                # Build candidate list for LLM
+                cand_lines = []
+                for i, c in enumerate(candidates):
+                    dur_str = self._format_duration(c.duration) if c.duration else "?"
+                    cand_lines.append(
+                        f"  [{i}] {c.title} | 时长: {dur_str} | 来源: {c.source}"
+                    )
+                cand_text = "\n".join(cand_lines)
+
+                prompt = f"""从以下候选歌曲中选出最匹配的一首。
+
+目标歌曲: {title} - {artist}
+
+候选列表:
+{cand_text}
+
+请只返回最匹配的候选编号（如 0, 1, 2...），不要返回其他内容。"""
+
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                )
+
+                # Parse LLM response to get index
+                answer = resp.completion_text.strip()
+                import re as _re
+                m = _re.search(r"\d+", answer)
+                if m:
+                    idx = int(m.group())
+                    if 0 <= idx < len(candidates):
+                        logger.info(
+                            f"[MusicShare] LLM picked candidate [{idx}]: "
+                            f"{candidates[idx].title!r}"
+                        )
+                        return candidates[idx]
+
+                logger.warning(
+                    f"[MusicShare] LLM returned unparseable response, falling back to scoring: {answer[:100]}"
+                )
+                return None
+            except Exception as e:
+                logger.warning(f"[MusicShare] LLM picker failed, falling back to scoring: {e}")
+                return None
+
+        return llm_pick
+
+    # ── Voice Recognition ─────────────────────────────────────────────────
+
+    async def _handle_voice_recognition(self, event: AstrMessageEvent, message_chain):
+        """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
+        if not self.config_helper.voice_recognition_enabled():
+            return
+
+        host = self.config_helper.acrcloud_host()
+        access_key = self.config_helper.acrcloud_access_key()
+        access_secret = self.config_helper.acrcloud_access_secret()
+
+        if not host or not access_key or not access_secret:
+            yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
+            return
+
+        # Find Record component
+        record = None
+        for comp in message_chain:
+            if comp.type == ComponentType.Record:
+                record = comp
+                break
+
+        if not record:
+            return
+
+        audio_path = None
+        try:
+            # Download voice file to local
+            audio_path = await record.convert_to_file_path()
+            logger.info(f"[MusicShare] 语音文件已下载: {audio_path}")
+
+            # Recognize via ACRCloud
+            title, artist = await self._acr_recognize(audio_path, host, access_key, access_secret)
+
+            if not title:
+                yield event.plain_result("❌ 未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
+                return
+
+            logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
+            yield event.plain_result(f"🎵 识别到歌曲: {title} - {artist}")
+
+            # Get cover metadata and send card
+            info = await self._resolve_llm_song_info(f"{title} {artist}")
+            if info and info.cover_url:
+                async for result in self._send_cover_card(event, info):
+                    yield result
+
+            # Download and send audio
+            expected_dur = info.duration if info else ""
+            async for result in self._download_then_send(
+                event, title, artist,
+                expected_duration=expected_dur,
+            ):
+                yield result
+
+        except Exception as e:
+            logger.error(f"[MusicShare] 语音识歌失败: {e}")
+            yield event.plain_result(f"❌ 语音识歌失败: {e}。该平台可能不支持语音消息接收。")
+        finally:
+            # Clean up temp audio file
+            if audio_path:
+                try:
+                    Path(audio_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    async def _acr_recognize(self, audio_path: str, host: str, access_key: str, access_secret: str):
+        """Recognize song from audio using ACRCloud. Returns (title, artist) or (None, None)."""
+        try:
+            from acrcloud.recognizer import ACRCloudRecognizer
+
+            config = {
+                'host': host,
+                'access_key': access_key,
+                'access_secret': access_secret,
+                'timeout': 10,
+            }
+
+            def _recognize():
+                recognizer = ACRCloudRecognizer(config)
+                result_str = recognizer.recognize_by_file(audio_path, 0)
+                return json.loads(result_str)
+
+            result = await asyncio.to_thread(_recognize)
+
+            if result.get("status", {}).get("code") == 0:
+                music_list = result.get("metadata", {}).get("music", [])
+                if music_list:
+                    music = music_list[0]
+                    title = music.get("title", "")
+                    artists = music.get("artists", [])
+                    artist = artists[0].get("name", "") if artists else ""
+                    return title, artist
+
+            return None, None
+        except ImportError:
+            logger.error("[MusicShare] pyacrcloud not installed. Run: pip install pyacrcloud")
+            return None, None
+        except Exception as e:
+            logger.error(f"[MusicShare] ACRCloud recognition error: {e}")
+            return None, None
+
     # ── Helpers ───────────────────────────────────────────────────────────
 
     async def _send_cover_card(self, event: AstrMessageEvent, song_info: SongInfo):
@@ -283,6 +475,7 @@ class MusicSharePlugin(Star):
     async def _download_then_send(
         self, event: AstrMessageEvent, title: str, artist: str,
         expected_duration: str = "",
+        force_mode: str = None,
     ):
         """Download audio and send voice + file.
 
@@ -292,11 +485,17 @@ class MusicSharePlugin(Star):
         download_dir = Path(StarTools.get_data_dir("music_share")) / "downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
 
+        # Create LLM picker closure if enabled
+        llm_picker = None
+        if self.config_helper.llm_search_enabled():
+            llm_picker = self._create_llm_picker(event)
+
         audio_file, error_msg = await self.downloader.search_and_download(
             title, artist,
             expected_duration=expected_duration,
             match_threshold=self.config_helper.match_threshold(),
             download_dir=download_dir,
+            llm_picker=llm_picker,
         )
 
         if not audio_file:
@@ -310,7 +509,10 @@ class MusicSharePlugin(Star):
             return
 
         try:
-            mode = self.config_helper.send_mode()
+            if force_mode:
+                mode = force_mode
+            else:
+                mode = self.config_helper.send_mode()
             record_sent = False
 
             if mode in ("仅语音", "都发送"):

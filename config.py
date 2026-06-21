@@ -40,6 +40,9 @@ class ConfigHelper:
         return int(self._cfg("match_threshold", 97))
 
     # ---- send mode ----
+    def llm_tool_mode(self) -> str:
+        return str(self._cfg("llm_tool_mode", "图片+语音")).strip()
+
     def send_mode(self) -> str:
         return str(self._cfg("send_mode", "都发送")).strip()
 
@@ -55,3 +58,21 @@ class ConfigHelper:
         if not enabled:
             return True
         return group_id in enabled
+
+    def llm_search_enabled(self) -> bool:
+        return bool(self._cfg("llm_search_enabled", False))
+
+    def llm_search_provider(self) -> str:
+        return str(self._cfg("llm_search_provider", "") or "").strip()
+
+    def voice_recognition_enabled(self) -> bool:
+        return bool(self._cfg("enable_voice_recognition", False))
+
+    def acrcloud_host(self) -> str:
+        return str(self._cfg("acrcloud_host", "") or "").strip()
+
+    def acrcloud_access_key(self) -> str:
+        return str(self._cfg("acrcloud_access_key", "") or "").strip()
+
+    def acrcloud_access_secret(self) -> str:
+        return str(self._cfg("acrcloud_access_secret", "") or "").strip()

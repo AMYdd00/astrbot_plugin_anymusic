@@ -2,11 +2,11 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/License-AGPLv3-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-blueviolet)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.3-blueviolet)](CHANGELOG.md)
 
 ## 简介
 
-AstrBot 全平台音乐插件。自动识别群聊中 11 大主流音乐平台分享链接，生成磨砂玻璃风格信息卡片，通过 yt-dlp + spotdl 双引擎竞争匹配下载高质量音频并发送语音/文件。
+AstrBot 全平台音乐插件。自动识别主流音乐平台分享链接，通过 yt-dlp + spotdl 双引擎竞争匹配下载高质量音频，支持 LLM 智能选歌、语音识歌与点歌。
 
 ## 功能特点
 
@@ -33,9 +33,11 @@ AstrBot 全平台音乐插件。自动识别群聊中 11 大主流音乐平台�
 ### 核心特性
 
 - ✅ **双引擎竞争下载** — yt-dlp + spotdl 并行搜索，通过多维评分选出最优音源
+- ✅ **LLM 智能选歌** — 开启后 LLM 从候选中分析并选出最匹配的版本，杜绝翻唱/原唱误匹配
+- ✅ **语音识歌** — 群内 @Bot 发送语音消息，ACRCloud 听歌识曲后自动下载（需配置密钥）
 - ✅ **时长精确匹配** — 解析原始歌曲时长，候选偏差超过阈值自动拒绝（默认 97% 精度可配置）
 - ✅ **多维评分系统** — 时长匹配 40% + 标题相似度 40% + 来源加分 20% + 负面关键词过滤
-- ✅ **信息卡片** — 磨砂玻璃深色风格卡片，展示专辑封面 + 歌曲信息 + 来源徽章
+- ✅ **信息卡片** — 深色风格卡片，展示专辑封面 + 歌曲信息，艺术家名自适应字号居中显示
 - ✅ **跨平台字体** — 自动下载 Noto Sans SC 字体，Windows/Linux/macOS 均完美渲染中英文
 - ✅ **LLM 点歌** — 说「我想听夜曲」「放一首晴天」，Bot 自动搜索下载
 - ✅ **语音 + 文件双发送** — 独立配置仅语音 / 仅文件 / 同时发送
@@ -109,6 +111,12 @@ pip install yt-dlp spotdl beautifulsoup4 aiohttp Pillow
 | `match_threshold` | int | `97` | 时长匹配精度 (%), 97 表示允许 +-3% 偏差 |
 | `send_mode` | string | `都发送` | 发送方式：仅语音 / 仅文件 / 都发送 |
 | `enabled_groups` | list | `[]` | 启用的群组，留空则所有群组生效 |
+| `llm_search_enabled` | bool | `false` | 启用 LLM 智能选歌，从候选中分析并选出最匹配版本 |
+| `llm_search_provider` | string | 空 | LLM 提供商 ID（需在 AI 配置中已添加），留空使用当前会话默认 |
+| `enable_voice_recognition` | bool | `false` | 启用语音识歌，群内 @Bot + 语音即可识别 |
+| `acrcloud_host` | string | 空 | ACRCloud 服务地址，如 `identify-eu-west-1.acrcloud.com` |
+| `acrcloud_access_key` | string | 空 | ACRCloud Access Key |
+| `acrcloud_access_secret` | string | 空 | ACRCloud Access Secret |
 
 ## 使用
 
@@ -119,6 +127,26 @@ pip install yt-dlp spotdl beautifulsoup4 aiohttp Pillow
 ### 首次使用
 
 插件首次生成信息卡片时会自动从 GitHub 下载 Noto Sans SC 字体（约 30MB）存储到 `plugins/astrbot_plugin_anymusic/fonts/` 目录。此过程仅执行一次，后续即时可用。
+
+### 语音识歌（可选）
+
+插件支持在群聊中 **@Bot + 发送语音消息** 来自动识别歌曲并下载。
+
+**前置准备**：需要注册 ACRCloud 账号获取免费 API 额度：
+
+1. 访问 [ACRCloud 控制台](https://console.acrcloud.com) 注册账号（选择免费试用计划）
+2. 创建新项目 → 选择 **Audio & Music Recognition**
+3. 在「API Keys」页面获取：
+   - `Access Key`（访问密钥）
+   - `Access Secret`（访问密钥密码）
+4. 根据账户区域选择 Host 地址：
+   - 欧洲地区：`identify-eu-west-1.acrcloud.com`
+   - 亚洲地区：`identify-ap-southeast-1.acrcloud.com`
+5. 回到插件配置页面，填入以上四个参数并开启 `enable_voice_recognition`
+
+> 免费额度为每天数百次识别，个人使用完全足够。
+> 
+> 注意：ACRCloud 对原曲片段识别精准，但对纯哼唱（无伴奏）支持较弱，建议发送包含原曲的语音。
 
 ### 匹配精度说明
 

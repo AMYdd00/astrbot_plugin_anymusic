@@ -3,3 +3,5 @@ beautifulsoup4>=4.12
 Pillow>=10.0
 spotdl>=4.2
 yt-dlp>=2026.6
+rapidfuzz>=3.0
+pyacrcloud>=1.0
