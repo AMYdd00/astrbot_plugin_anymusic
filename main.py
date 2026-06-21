@@ -37,7 +37,7 @@ from .utils import (
 
 @register("astrbot_plugin_anymusic", "user", "AnyMusic", "1.0.3")
 class MusicSharePlugin(Star):
-    """Auto-detect music links & LLM song search tool."""
+    """Auto-detect music links & LLM song search / voice recognition tool."""
 
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -61,19 +61,15 @@ class MusicSharePlugin(Star):
         '''
         logger.info(f"[MusicShare] LLM 点歌: '{song_name}'")
 
-        # Get cover art for card (if mode includes image)
         mode = self.config_helper.llm_tool_mode()
         info = None
         if mode != "仅语音":
             info = await self._resolve_llm_song_info(song_name)
 
-        # Send cover card if image mode
         if info and "图片" in mode:
             async for result in self._send_cover_card(event, info):
                 yield result
 
-        # Download and send audio
-        # Use llm_tool_mode for sending: if 都发送, send both voice and file
         song_title = info.title if info else song_name
         song_artist = info.artist if info else ""
         song_dur = info.duration if info else ""
@@ -83,6 +79,23 @@ class MusicSharePlugin(Star):
             expected_duration=song_dur or "",
             force_mode=(mode if mode == "都发送" else None),
         ):
+            yield result
+
+    # ── LLM Tool: recognize_song ─────────────────────────────────────────
+
+    @filter.llm_tool(name="recognize_song")
+    async def recognize_song(self, event: AstrMessageEvent):
+        '''听歌识曲工具。当用户发送语音消息并想识别其中的歌曲时使用此工具。
+        适用场景：用户说"这是什么歌"、"帮我识歌"、"听歌识曲"、"识别一下这首歌"，或发送语音并询问歌曲信息。
+        调用后会自动从消息上下文中的语音消息提取音频，通过 ACRCloud 识别歌曲，展示封面卡片并下载发送。
+
+        Args:
+            无参数（自动从当前消息上下文中获取语音消息）
+        '''
+        logger.info("[MusicShare] LLM 语音识歌")
+
+        message_chain = event.get_message_chain()
+        async for result in self._handle_voice_recognition(event, message_chain):
             yield result
 
     # ── Auto-detect music links ───────────────────────────────────────────
@@ -98,17 +111,6 @@ class MusicSharePlugin(Star):
             if group_id and not self.config_helper.is_group_enabled(group_id):
                 return
 
-        # ── Voice recognition: @bot + voice message ──
-        message_chain = event.get_message_chain()
-        has_record = any(c.type == ComponentType.Record for c in message_chain)
-        has_at = any(c.type == ComponentType.At for c in message_chain)
-
-        if has_record and has_at and self.config_helper.voice_recognition_enabled():
-            logger.info("[MusicShare] 检测到 @Bot + 语音消息，开始识歌")
-            async for result in self._handle_voice_recognition(event, message_chain):
-                yield result
-            return  # Don't continue to link parsing
-
         message_text = event.message_str or ""
         result = extract_music_url(message_text)
         if result is None:
@@ -117,7 +119,6 @@ class MusicSharePlugin(Star):
 
         logger.info(f"[MusicShare] 检测到 {platform.name} 链接: {url}")
 
-        # Check cache
         song_info = self._cache.get(url)
         if song_info is None:
             song_info = await self._resolve_song_info(url, platform)
@@ -131,12 +132,10 @@ class MusicSharePlugin(Star):
             f"{song_info.title} - {song_info.artist}"
         )
 
-        # Send cover card
         if song_info.cover_url:
             async for result in self._send_cover_card(event, song_info):
                 yield result
 
-        # Download and send audio (dual-engine competition for ALL platforms)
         async for result in self._download_then_send(
             event, song_info.title, song_info.artist,
             expected_duration=song_info.duration,
@@ -149,17 +148,14 @@ class MusicSharePlugin(Star):
         """Resolve song metadata based on the platform type."""
         proxy = self.config_helper.proxy() or ""
 
-        # ── Structured parsers (Spotify / Apple Music) ──
         if platform == Platform.SPOTIFY:
             return await self.spotify_parser.parse(url)
         if platform == Platform.APPLE_MUSIC:
             return await self.apple_parser.parse(url)
 
-        # ── URL-direct platforms: use yt-dlp --dump-json ──
         if platform in (Platform.YOUTUBE, Platform.SOUNDCLOUD, Platform.BILIBILI_AUDIO):
             return await self._resolve_via_ytdlp(url)
 
-        # ── Domestic platforms: parse HTML <title> ──
         if platform in (
             Platform.NETEASE, Platform.QQ_MUSIC,
             Platform.KUGOU, Platform.KUWO, Platform.MIGU,
@@ -223,7 +219,6 @@ class MusicSharePlugin(Star):
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
-        """Format seconds as M:SS or H:MM:SS."""
         m, s = divmod(int(seconds), 60)
         h, m = divmod(m, 60)
         if h:
@@ -293,7 +288,6 @@ class MusicSharePlugin(Star):
                     umo = event.unified_msg_origin
                     provider_id = await self.context.get_current_chat_provider_id(umo)
 
-                # Build candidate list for LLM
                 cand_lines = []
                 for i, c in enumerate(candidates):
                     dur_str = self._format_duration(c.duration) if c.duration else "?"
@@ -316,7 +310,6 @@ class MusicSharePlugin(Star):
                     prompt=prompt,
                 )
 
-                # Parse LLM response to get index
                 answer = resp.completion_text.strip()
                 import re as _re
                 m = _re.search(r"\d+", answer)
@@ -354,7 +347,6 @@ class MusicSharePlugin(Star):
             yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
             return
 
-        # Find Record component
         record = None
         for comp in message_chain:
             if comp.type == ComponentType.Record:
@@ -362,31 +354,28 @@ class MusicSharePlugin(Star):
                 break
 
         if not record:
+            yield event.plain_result("未在消息中找到语音，请发送一段包含歌曲的语音消息。")
             return
 
         audio_path = None
         try:
-            # Download voice file to local
             audio_path = await record.convert_to_file_path()
             logger.info(f"[MusicShare] 语音文件已下载: {audio_path}")
 
-            # Recognize via ACRCloud
             title, artist = await self._acr_recognize(audio_path, host, access_key, access_secret)
 
             if not title:
-                yield event.plain_result("❌ 未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
+                yield event.plain_result("未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
                 return
 
             logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
-            yield event.plain_result(f"🎵 识别到歌曲: {title} - {artist}")
+            yield event.plain_result(f"识别到歌曲: {title} - {artist}")
 
-            # Get cover metadata and send card
             info = await self._resolve_llm_song_info(f"{title} {artist}")
             if info and info.cover_url:
                 async for result in self._send_cover_card(event, info):
                     yield result
 
-            # Download and send audio
             expected_dur = info.duration if info else ""
             async for result in self._download_then_send(
                 event, title, artist,
@@ -396,9 +385,8 @@ class MusicSharePlugin(Star):
 
         except Exception as e:
             logger.error(f"[MusicShare] 语音识歌失败: {e}")
-            yield event.plain_result(f"❌ 语音识歌失败: {e}。该平台可能不支持语音消息接收。")
+            yield event.plain_result(f"语音识歌失败: {e}。该平台可能不支持语音消息接收。")
         finally:
-            # Clean up temp audio file
             if audio_path:
                 try:
                     Path(audio_path).unlink(missing_ok=True)
@@ -477,15 +465,10 @@ class MusicSharePlugin(Star):
         expected_duration: str = "",
         force_mode: str = None,
     ):
-        """Download audio and send voice + file.
-
-        If the platform does not support Record (voice) messages,
-        automatically falls back to sending as a File.
-        """
+        """Download audio and send voice + file."""
         download_dir = Path(StarTools.get_data_dir("music_share")) / "downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create LLM picker closure if enabled
         llm_picker = None
         if self.config_helper.llm_search_enabled():
             llm_picker = self._create_llm_picker(event)

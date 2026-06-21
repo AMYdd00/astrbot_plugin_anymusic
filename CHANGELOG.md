@@ -3,10 +3,11 @@
 ## [1.0.3] - 2026-06-22
 
 ### Added
-- 语音识歌：群内 @Bot 发送语音消息，通过 ACRCloud 识别歌曲并自动下载
+- 语音识歌 LLM 工具 `recognize_song`：用户说"识歌""这是什么歌"并发送语音，LLM 自动调用 ACRCloud 识曲下载
 - 新增 `enable_voice_recognition`、`acrcloud_host`、`acrcloud_access_key`、`acrcloud_access_secret` 配置项
 
 ### Changed
+- 语音识歌改为 LLM 工具调用，不再硬编码 @bot 触发，更灵活自然
 - 依赖新增 `pyacrcloud` 和 `rapidfuzz`
 - 插件描述更新
 
