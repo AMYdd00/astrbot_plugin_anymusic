@@ -109,17 +109,16 @@ class MusicSharePlugin(Star):
 
         message_text = event.message_str or ""
 
-        # ── Voice recognition fallback: Record + keyword detection ──
+        # ── Voice recognition fallback: keyword detection (with or without Record) ──
         if self.config_helper.voice_recognition_enabled():
             raw = event.get_message_outline() or ""
             has_record = "[CQ:record" in raw
-            if has_record:
-                voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲"]
-                if any(kw in message_text for kw in voice_keywords):
-                    logger.info("[MusicShare] 检测到语音识歌关键词，触发识别")
-                    async for result in self._handle_voice_recognition(event):
-                        yield result
-                    return
+            voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲"]
+            if has_record or any(kw in message_text for kw in voice_keywords):
+                logger.info("[MusicShare] 检测到语音识歌触发条件")
+                async for result in self._handle_voice_recognition(event):
+                    yield result
+                return
 
         result = extract_music_url(message_text)
         if result is None:
