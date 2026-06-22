@@ -7,6 +7,7 @@ astrbot_plugin_anymusic - AnyMusic 音乐插件
 import asyncio
 import json
 import re as _re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +50,8 @@ class MusicSharePlugin(Star):
         self.spotify_parser = SpotifyParser()
         self.downloader = MusicDownloader(self.config_helper)
         self._cache = ResultCache(ttl_seconds=600)
+        # Cache for OneBot voice recognition: store last Record URL per group
+        self._group_last_record: dict[str, tuple[str, float]] = {}
 
     # ── LLM Tool: search_song ────────────────────────────────────────────
 
@@ -108,10 +111,23 @@ class MusicSharePlugin(Star):
                 return
 
         message_text = event.message_str or ""
+        raw = event.get_message_outline() or ""
 
-        # ── Voice recognition fallback: keyword detection ──
+        # ── Cache voice Record URLs for OneBot reply recognition ──
+        if self.config_helper.voice_recognition_enabled() and "[CQ:record" in raw:
+            if is_group_event(event):
+                try:
+                    gid = str(event.get_group_id())
+                except Exception:
+                    gid = ""
+                if gid:
+                    url = self._parse_record_url_from_raw(raw)
+                    if url:
+                        self._group_last_record[gid] = (url, time.time())
+                        logger.info(f"[MusicShare] 缓存语音 URL for group {gid}")
+
+        # ── Voice recognition: keyword detection ──
         if self.config_helper.voice_recognition_enabled():
-            raw = event.get_message_outline() or ""
             has_record = "[CQ:record" in raw
             voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲"]
             if has_record or any(kw in message_text for kw in voice_keywords):
@@ -345,54 +361,19 @@ class MusicSharePlugin(Star):
             return m.group(1).strip()
         return None
 
-    def _extract_record_from_reply(self, message_obj) -> Optional[Record]:
-        """Extract Record component from a replied-to message via Reply.chain."""
-        if message_obj is None:
-            return None
-        for comp in message_obj.message:
-            if comp.type == ComponentType.Reply:
-                chain = getattr(comp, 'chain', None) or []
-                for c in chain:
-                    if c.type == ComponentType.Record:
-                        return c
-        return None
-
-    async def _find_latest_temp_wav(self) -> Optional[str]:
-        """Find the most recent media_audio_*.wav in AstrBot's temp directory."""
-        temp_dir = Path("/AstrBot/data/temp")
-        if not temp_dir.exists():
-            return None
-        wavs = sorted(
-            temp_dir.glob("media_audio_*.wav"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return str(wavs[0]) if wavs else None
-
-    async def _convert_to_wav(self, audio_path: str) -> Optional[str]:
-        """Convert AMR/SILK audio to WAV using ffmpeg."""
-        wav_path = str(Path(audio_path).with_suffix(".wav"))
+    def _get_cached_record_url(self, event: AstrMessageEvent) -> Optional[str]:
+        """Get cached voice URL for this group (OneBot reply fallback)."""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-i", audio_path,
-                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                wav_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode == 0 and Path(wav_path).exists():
-                return wav_path
-            logger.warning(
-                f"[MusicShare] ffmpeg failed: {stderr.decode('utf-8', errors='replace')[:200]}"
-            )
+            gid = str(event.get_group_id())
+        except Exception:
             return None
-        except FileNotFoundError:
-            logger.warning("[MusicShare] ffmpeg not found, skip conversion")
-            return None
-        except Exception as e:
-            logger.warning(f"[MusicShare] ffmpeg error: {e}")
-            return None
+        entry = self._group_last_record.get(gid)
+        if entry:
+            url, ts = entry
+            if time.time() - ts < 120:
+                return url
+            del self._group_last_record[gid]
+        return None
 
     async def _handle_voice_recognition(self, event: AstrMessageEvent):
         """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
@@ -407,7 +388,7 @@ class MusicSharePlugin(Star):
             yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
             return
 
-        # 1) Try to get Record from message_chain
+        # 1) Try message_chain
         record = None
         try:
             message_chain = event.get_message_chain()
@@ -418,7 +399,7 @@ class MusicSharePlugin(Star):
         except Exception:
             pass
 
-        # 2) Fallback: parse Record from raw outline
+        # 2) Parse from raw outline
         if not record:
             raw = event.get_message_outline() or ""
             if "[CQ:record" in raw:
@@ -426,52 +407,26 @@ class MusicSharePlugin(Star):
                 if url:
                     record = Record(file=url)
 
-        # 3) Fallback: reply to voice — extract Record from Reply.chain
+        # 3) Reply + cached voice URL (OneBot fallback)
         if not record:
             raw = event.get_message_outline() or ""
             if "[CQ:reply" in raw:
-                record = self._extract_record_from_reply(event.message_obj)
-
-        # 4) Last resort: reply voice — grab AstrBot's auto-converted WAV
-        if not record:
-            raw = event.get_message_outline() or ""
-            if "[CQ:reply" in raw:
-                wav_found = await self._find_latest_temp_wav()
-                if wav_found:
-                    logger.info(f"[MusicShare] 使用 AstrBot 临时 WAV: {wav_found}")
-                    title, artist = await self._acr_recognize(
-                        wav_found, host, access_key, access_secret
-                    )
-                    if not title:
-                        yield event.plain_result("未识别到歌曲，请确认引用的语音中包含清晰的原曲片段。")
-                        return
-                    logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
-                    yield event.plain_result(f"识别到歌曲: {title} - {artist}")
-                    info = await self._resolve_llm_song_info(f"{title} {artist}")
-                    if info and info.cover_url:
-                        async for result in self._send_cover_card(event, info):
-                            yield result
-                    expected_dur = info.duration if info else ""
-                    async for result in self._download_then_send(
-                        event, title, artist, expected_duration=expected_dur,
-                    ):
-                        yield result
-                    return
+                cached_url = self._get_cached_record_url(event)
+                if cached_url:
+                    record = Record(file=cached_url)
+                    logger.info(f"[MusicShare] 使用缓存的语音 URL: {cached_url}")
 
         if not record:
             yield event.plain_result("未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。")
             return
 
         audio_path = None
-        wav_path = None
         try:
             audio_path = await record.convert_to_file_path()
             logger.info(f"[MusicShare] 语音文件已下载: {audio_path}")
 
-            wav_path = await self._convert_to_wav(audio_path) or audio_path
-
             title, artist = await self._acr_recognize(
-                wav_path, host, access_key, access_secret
+                audio_path, host, access_key, access_secret
             )
 
             if not title:
