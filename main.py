@@ -6,6 +6,7 @@ astrbot_plugin_anymusic - AnyMusic 音乐插件
 
 import asyncio
 import json
+import re as _re
 from pathlib import Path
 from typing import Optional
 
@@ -88,14 +89,9 @@ class MusicSharePlugin(Star):
         '''听歌识曲工具。当用户发送语音消息并想识别其中的歌曲时使用此工具。
         适用场景：用户说"这是什么歌"、"帮我识歌"、"听歌识曲"、"识别一下这首歌"，或发送语音并询问歌曲信息。
         调用后会自动从消息上下文中的语音消息提取音频，通过 ACRCloud 识别歌曲，展示封面卡片并下载发送。
-
-        Args:
-            无参数（自动从当前消息上下文中获取语音消息）
         '''
         logger.info("[MusicShare] LLM 语音识歌")
-
-        message_chain = event.get_message_chain()
-        async for result in self._handle_voice_recognition(event, message_chain):
+        async for result in self._handle_voice_recognition(event):
             yield result
 
     # ── Auto-detect music links ───────────────────────────────────────────
@@ -111,20 +107,20 @@ class MusicSharePlugin(Star):
             if group_id and not self.config_helper.is_group_enabled(group_id):
                 return
 
+        message_text = event.message_str or ""
+
         # ── Voice recognition fallback: Record + keyword detection ──
         if self.config_helper.voice_recognition_enabled():
-            msg_chain = event.get_message_chain()
-            has_record = any(c.type == ComponentType.Record for c in msg_chain)
+            raw = event.get_message_outline() or ""
+            has_record = "[CQ:record" in raw
             if has_record:
-                text = event.message_str or ""
-                voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲", "识歌"]
-                if any(kw in text for kw in voice_keywords):
+                voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲"]
+                if any(kw in message_text for kw in voice_keywords):
                     logger.info("[MusicShare] 检测到语音识歌关键词，触发识别")
-                    async for result in self._handle_voice_recognition(event, msg_chain):
+                    async for result in self._handle_voice_recognition(event):
                         yield result
                     return
 
-        message_text = event.message_str or ""
         result = extract_music_url(message_text)
         if result is None:
             return
@@ -324,7 +320,6 @@ class MusicSharePlugin(Star):
                 )
 
                 answer = resp.completion_text.strip()
-                import re as _re
                 m = _re.search(r"\d+", answer)
                 if m:
                     idx = int(m.group())
@@ -347,7 +342,18 @@ class MusicSharePlugin(Star):
 
     # ── Voice Recognition ─────────────────────────────────────────────────
 
-    async def _handle_voice_recognition(self, event: AstrMessageEvent, message_chain):
+    def _parse_record_url_from_raw(self, raw_msg: str) -> Optional[str]:
+        """Extract the audio file URL from a CQ record code in raw message."""
+        m = _re.search(r'\[CQ:record,[^\]]*url=([^,\]]+)', raw_msg)
+        if m:
+            return m.group(1).strip()
+        # Try file path fallback
+        m = _re.search(r'\[CQ:record,[^\]]*file=([^,\]]+)', raw_msg)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    async def _handle_voice_recognition(self, event: AstrMessageEvent):
         """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
         if not self.config_helper.voice_recognition_enabled():
             return
@@ -360,11 +366,27 @@ class MusicSharePlugin(Star):
             yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
             return
 
+        # Try to get Record from message_chain (works on most platforms)
         record = None
-        for comp in message_chain:
-            if comp.type == ComponentType.Record:
-                record = comp
-                break
+        try:
+            message_chain = event.get_message_chain()
+            for comp in message_chain:
+                if comp.type == ComponentType.Record:
+                    record = comp
+                    break
+        except Exception:
+            pass
+
+        # Fallback: parse Record from raw outline
+        if not record:
+            raw = event.get_message_outline() or ""
+            if "[CQ:record" not in raw:
+                yield event.plain_result("未在消息中找到语音，请发送一段包含歌曲的语音消息。")
+                return
+            # Try to create Record from URL
+            url = self._parse_record_url_from_raw(raw)
+            if url:
+                record = Record(file=url)
 
         if not record:
             yield event.plain_result("未在消息中找到语音，请发送一段包含歌曲的语音消息。")
