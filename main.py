@@ -379,16 +379,45 @@ class MusicSharePlugin(Star):
         # Fallback: parse Record from raw outline
         if not record:
             raw = event.get_message_outline() or ""
-            if "[CQ:record" not in raw:
-                yield event.plain_result("未在消息中找到语音，请发送一段包含歌曲的语音消息。")
-                return
-            # Try to create Record from URL
-            url = self._parse_record_url_from_raw(raw)
-            if url:
-                record = Record(file=url)
+            if "[CQ:record" in raw:
+                url = self._parse_record_url_from_raw(raw)
+                if url:
+                    record = Record(file=url)
+
+        # Fallback 2: reply to a voice message — grab AstrBot's auto-converted WAV
+        if not record:
+            raw = event.get_message_outline() or ""
+            is_reply = "[CQ:reply" in raw
+            if is_reply:
+                wav_found = await self._find_latest_temp_wav()
+                if wav_found:
+                    audio_path = wav_found
+                    logger.info(f"[MusicShare] 使用引用消息的语音: {audio_path}")
+                    # Skip record-based download, go straight to recognition
+                    title, artist = await self._acr_recognize(
+                        audio_path, host, access_key, access_secret
+                    )
+                    if not title:
+                        yield event.plain_result("未识别到歌曲，请确认引用的语音中包含清晰的原曲片段。")
+                        return
+                    logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
+                    yield event.plain_result(f"识别到歌曲: {title} - {artist}")
+                    info = await self._resolve_llm_song_info(f"{title} {artist}")
+                    if info and info.cover_url:
+                        async for result in self._send_cover_card(event, info):
+                            yield result
+                    expected_dur = info.duration if info else ""
+                    async for result in self._download_then_send(
+                        event, title, artist,
+                        expected_duration=expected_dur,
+                    ):
+                        yield result
+                    return
 
         if not record:
-            yield event.plain_result("未在消息中找到语音，请发送一段包含歌曲的语音消息。")
+            yield event.plain_result(
+                "未在消息中找到语音。请直接发送语音消息（而非引用回复），并附上「识歌」「什么歌」等文字。"
+            )
             return
 
         audio_path = None
@@ -434,6 +463,21 @@ class MusicSharePlugin(Star):
                     Path(audio_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    async def _find_latest_temp_wav(self) -> Optional[str]:
+        """Find the most recently created media_audio_*.wav in AstrBot's temp directory.
+        
+        AstrBot auto-converts voice messages to WAV at /AstrBot/data/temp/media_audio_*.wav
+        """
+        temp_dir = Path("/AstrBot/data/temp")
+        if not temp_dir.exists():
+            return None
+        wavs = sorted(
+            temp_dir.glob("media_audio_*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return str(wavs[0]) if wavs else None
 
     async def _convert_to_wav(self, audio_path: str) -> Optional[str]:
         """Convert AMR/SILK audio to WAV using ffmpeg."""
