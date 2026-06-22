@@ -6,11 +6,13 @@ astrbot_plugin_anymusic - AnyMusic 音乐插件
 
 import asyncio
 import json
+import os
 import re as _re
 import time
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
@@ -50,8 +52,9 @@ class MusicSharePlugin(Star):
         self.spotify_parser = SpotifyParser()
         self.downloader = MusicDownloader(self.config_helper)
         self._cache = ResultCache(ttl_seconds=600)
-        # Cache for OneBot voice recognition: store last Record URL per group
-        self._group_last_record: dict[str, tuple[str, float]] = {}
+        # Voice URL cache: {(group_id, user_id): (url, timestamp)}
+        self._voice_url_cache: dict[str, tuple[str, float]] = {}
+        self._voice_cache_ttl = 120
 
     # ── LLM Tool: search_song ────────────────────────────────────────────
 
@@ -113,18 +116,14 @@ class MusicSharePlugin(Star):
         message_text = event.message_str or ""
         raw = event.get_message_outline() or ""
 
-        # ── Cache voice Record URLs for OneBot reply recognition ──
+        # ── Cache voice URL whenever a voice message is sent ──
         if self.config_helper.voice_recognition_enabled() and "[CQ:record" in raw:
-            if is_group_event(event):
-                try:
-                    gid = str(event.get_group_id())
-                except Exception:
-                    gid = ""
-                if gid:
-                    url = self._parse_record_url_from_raw(raw)
-                    if url:
-                        self._group_last_record[gid] = (url, time.time())
-                        logger.info(f"[MusicShare] 缓存语音 URL for group {gid}")
+            url = self._parse_record_url_from_raw(raw)
+            if url:
+                session_key = self._get_voice_session_key(event)
+                if session_key:
+                    self._voice_url_cache[session_key] = (url, time.time())
+                    logger.info(f"[MusicShare] 缓存语音 URL for {session_key}")
 
         # ── Voice recognition: keyword detection ──
         if self.config_helper.voice_recognition_enabled():
@@ -351,6 +350,18 @@ class MusicSharePlugin(Star):
 
     # ── Voice Recognition ─────────────────────────────────────────────────
 
+    def _get_voice_session_key(self, event: AstrMessageEvent) -> Optional[str]:
+        """Build a unique session key for voice URL caching: group_id:user_id."""
+        try:
+            gid = str(event.get_group_id()) if is_group_event(event) else "private"
+        except Exception:
+            gid = "private"
+        try:
+            uid = str(event.get_sender_id())
+        except Exception:
+            return None
+        return f"{gid}:{uid}"
+
     def _parse_record_url_from_raw(self, raw_msg: str) -> Optional[str]:
         """Extract the audio file URL from a CQ record code in raw message."""
         m = _re.search(r'\[CQ:record,[^\]]*url=([^,\]]+)', raw_msg)
@@ -361,22 +372,46 @@ class MusicSharePlugin(Star):
             return m.group(1).strip()
         return None
 
-    def _get_cached_record_url(self, event: AstrMessageEvent) -> Optional[str]:
-        """Get cached voice URL for this group (OneBot reply fallback)."""
-        try:
-            gid = str(event.get_group_id())
-        except Exception:
+    def _get_cached_voice_url(self, event: AstrMessageEvent) -> Optional[str]:
+        """Get cached voice URL for this session (reply fallback)."""
+        session_key = self._get_voice_session_key(event)
+        if not session_key:
             return None
-        entry = self._group_last_record.get(gid)
+        entry = self._voice_url_cache.get(session_key)
         if entry:
             url, ts = entry
-            if time.time() - ts < 120:
+            if time.time() - ts < self._voice_cache_ttl:
                 return url
-            del self._group_last_record[gid]
+            del self._voice_url_cache[session_key]
         return None
+
+    async def _download_voice_url(self, url: str) -> Optional[str]:
+        """Download voice from HTTPS URL to a local temp file."""
+        temp_dir = Path(StarTools.get_data_dir("music_share")) / "voice_temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        local_path = str(temp_dir / f"voice_{uuid.uuid4().hex}.amr")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        with open(local_path, "wb") as f:
+                            f.write(await resp.read())
+                        return local_path
+                    else:
+                        logger.warning(f"[MusicShare] 语音下载失败 HTTP {resp.status}")
+                        return None
+        except Exception as e:
+            logger.warning(f"[MusicShare] 语音下载异常: {e}")
+            return None
 
     async def _handle_voice_recognition(self, event: AstrMessageEvent):
         """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
+        import uuid
+
         if not self.config_helper.voice_recognition_enabled():
             return
 
@@ -388,42 +423,45 @@ class MusicSharePlugin(Star):
             yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
             return
 
-        # 1) Try message_chain
-        record = None
-        try:
-            message_chain = event.get_message_chain()
-            for comp in message_chain:
-                if comp.type == ComponentType.Record:
-                    record = comp
-                    break
-        except Exception:
-            pass
+        raw = event.get_message_outline() or ""
+        audio_path = None
+        should_clean = False
 
-        # 2) Parse from raw outline
-        if not record:
-            raw = event.get_message_outline() or ""
-            if "[CQ:record" in raw:
+        try:
+            # 1) Direct voice message — Record in message_chain
+            record = None
+            try:
+                message_chain = event.get_message_chain()
+                for comp in message_chain:
+                    if comp.type == ComponentType.Record:
+                        record = comp
+                        break
+            except Exception:
+                pass
+
+            if record:
+                audio_path = await record.convert_to_file_path()
+                logger.info(f"[MusicShare] 语音文件已下载 (chain): {audio_path}")
+
+            # 2) Current message contains [CQ:record — parse URL
+            if not audio_path and "[CQ:record" in raw:
                 url = self._parse_record_url_from_raw(raw)
                 if url:
-                    record = Record(file=url)
+                    logger.info(f"[MusicShare] 下载语音 URL (raw): {url}")
+                    audio_path = await self._download_voice_url(url)
+                    should_clean = True
 
-        # 3) Reply + cached voice URL (OneBot fallback)
-        if not record:
-            raw = event.get_message_outline() or ""
-            if "[CQ:reply" in raw:
-                cached_url = self._get_cached_record_url(event)
+            # 3) Reply to a voice — try cached URL
+            if not audio_path and "[CQ:reply" in raw:
+                cached_url = self._get_cached_voice_url(event)
                 if cached_url:
-                    record = Record(file=cached_url)
-                    logger.info(f"[MusicShare] 使用缓存的语音 URL: {cached_url}")
+                    logger.info(f"[MusicShare] 下载语音 URL (cached): {cached_url}")
+                    audio_path = await self._download_voice_url(cached_url)
+                    should_clean = True
 
-        if not record:
-            yield event.plain_result("未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。")
-            return
-
-        audio_path = None
-        try:
-            audio_path = await record.convert_to_file_path()
-            logger.info(f"[MusicShare] 语音文件已下载: {audio_path}")
+            if not audio_path:
+                yield event.plain_result("未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。")
+                return
 
             title, artist = await self._acr_recognize(
                 audio_path, host, access_key, access_secret
@@ -451,7 +489,7 @@ class MusicSharePlugin(Star):
             logger.error(f"[MusicShare] 语音识歌失败: {e}")
             yield event.plain_result(f"语音识歌失败: {e}。该平台可能不支持语音消息接收。")
         finally:
-            if audio_path:
+            if audio_path and should_clean:
                 try:
                     Path(audio_path).unlink(missing_ok=True)
                 except Exception:
