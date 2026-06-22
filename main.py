@@ -393,11 +393,19 @@ class MusicSharePlugin(Star):
             return
 
         audio_path = None
+        wav_path = None
         try:
             audio_path = await record.convert_to_file_path()
             logger.info(f"[MusicShare] 语音文件已下载: {audio_path}")
 
-            title, artist = await self._acr_recognize(audio_path, host, access_key, access_secret)
+            # QQ 语音是 AMR/SILK 格式，需用 ffmpeg 转 WAV
+            wav_path = await self._convert_to_wav(audio_path)
+            if wav_path:
+                logger.info(f"[MusicShare] 音频已转码为 WAV: {wav_path}")
+            else:
+                wav_path = audio_path  # 转码失败则用原文件
+
+            title, artist = await self._acr_recognize(wav_path, host, access_key, access_secret)
 
             if not title:
                 yield event.plain_result("未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
@@ -427,6 +435,32 @@ class MusicSharePlugin(Star):
                     Path(audio_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    async def _convert_to_wav(self, audio_path: str) -> Optional[str]:
+        """Convert AMR/SILK audio to WAV using ffmpeg."""
+        import uuid
+
+        wav_path = str(Path(audio_path).with_suffix(".wav"))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", audio_path,
+                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                wav_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=15,
+            )
+            if proc.returncode == 0 and Path(wav_path).exists():
+                return wav_path
+            logger.warning(
+                f"[MusicShare] ffmpeg convert failed: {stderr.decode('utf-8', errors='replace')[:200]}"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"[MusicShare] ffmpeg not available or failed: {e}")
+            return None
 
     async def _acr_recognize(self, audio_path: str, host: str, access_key: str, access_secret: str):
         """Recognize song from audio using ACRCloud. Returns (title, artist) or (None, None)."""

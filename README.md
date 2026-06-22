@@ -91,6 +91,8 @@ pip install -r astrbot_plugin_anymusic/requirements.txt
 | `beautifulsoup4` | HTML 解析（Apple Music / 国内平台） |
 | `aiohttp` | 异步 HTTP 请求 |
 | `Pillow` | 信息卡片图片生成 |
+| `ffmpeg` | QQ 语音 AMR 转码（语音识歌必需） |
+| `pyacrcloud` | ACRCloud 听歌识曲（语音识歌必需） |
 
 ```bash
 pip install yt-dlp spotdl beautifulsoup4 aiohttp Pillow
