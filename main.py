@@ -352,6 +352,18 @@ class MusicSharePlugin(Star):
             return m.group(1).strip()
         return None
 
+    def _extract_record_from_reply(self, message_obj) -> Optional[Record]:
+        """Extract Record component from Reply.chain in a replied-to message."""
+        if message_obj is None:
+            return None
+        for comp in message_obj.message:
+            if comp.type == ComponentType.Reply:
+                chain = getattr(comp, 'chain', None) or []
+                for c in chain:
+                    if c.type == ComponentType.Record:
+                        return c
+        return None
+
     async def _handle_voice_recognition(self, event: AstrMessageEvent):
         """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
         if not self.config_helper.voice_recognition_enabled():
@@ -384,35 +396,37 @@ class MusicSharePlugin(Star):
                 if url:
                     record = Record(file=url)
 
-        # Fallback 2: reply to a voice message — grab AstrBot's auto-converted WAV
+        # Fallback 2: reply to a voice message — extract Record from Reply.chain
         if not record:
             raw = event.get_message_outline() or ""
             is_reply = "[CQ:reply" in raw
             if is_reply:
-                wav_found = await self._find_latest_temp_wav()
-                if wav_found:
-                    audio_path = wav_found
-                    logger.info(f"[MusicShare] 使用引用消息的语音: {audio_path}")
-                    # Skip record-based download, go straight to recognition
-                    title, artist = await self._acr_recognize(
-                        audio_path, host, access_key, access_secret
-                    )
-                    if not title:
-                        yield event.plain_result("未识别到歌曲，请确认引用的语音中包含清晰的原曲片段。")
-                        return
-                    logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
-                    yield event.plain_result(f"识别到歌曲: {title} - {artist}")
-                    info = await self._resolve_llm_song_info(f"{title} {artist}")
-                    if info and info.cover_url:
-                        async for result in self._send_cover_card(event, info):
+                record = self._extract_record_from_reply(event.message_obj)
+                if not record:
+                    # Last resort: try AstrBot's auto-converted WAV
+                    wav_found = await self._find_latest_temp_wav()
+                    if wav_found:
+                        logger.info(f"[MusicShare] 使用 AstrBot 临时 WAV: {wav_found}")
+                        audio_path = wav_found
+                        title, artist = await self._acr_recognize(
+                            audio_path, host, access_key, access_secret
+                        )
+                        if not title:
+                            yield event.plain_result("未识别到歌曲，请确认引用的语音中包含清晰的原曲片段。")
+                            return
+                        logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
+                        yield event.plain_result(f"识别到歌曲: {title} - {artist}")
+                        info = await self._resolve_llm_song_info(f"{title} {artist}")
+                        if info and info.cover_url:
+                            async for result in self._send_cover_card(event, info):
+                                yield result
+                        expected_dur = info.duration if info else ""
+                        async for result in self._download_then_send(
+                            event, title, artist,
+                            expected_duration=expected_dur,
+                        ):
                             yield result
-                    expected_dur = info.duration if info else ""
-                    async for result in self._download_then_send(
-                        event, title, artist,
-                        expected_duration=expected_dur,
-                    ):
-                        yield result
-                    return
+                        return
 
         if not record:
             yield event.plain_result(
