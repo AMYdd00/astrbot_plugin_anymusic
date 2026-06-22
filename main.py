@@ -109,7 +109,7 @@ class MusicSharePlugin(Star):
 
         message_text = event.message_str or ""
 
-        # ── Voice recognition fallback: keyword detection (with or without Record) ──
+        # ── Voice recognition fallback: keyword detection ──
         if self.config_helper.voice_recognition_enabled():
             raw = event.get_message_outline() or ""
             has_record = "[CQ:record" in raw
@@ -188,13 +188,9 @@ class MusicSharePlugin(Star):
             if not python_exe:
                 return None
             cmd = [
-                python_exe, "-m", "yt_dlp",
-                url,
-                "--dump-json",
-                "--no-warnings",
-                "--skip-download",
-                "--quiet",
-                "--no-playlist",
+                python_exe, "-m", "yt_dlp", url,
+                "--dump-json", "--no-warnings", "--skip-download",
+                "--quiet", "--no-playlist",
             ]
             proxy = self.config_helper.proxy()
             if proxy:
@@ -251,8 +247,7 @@ class MusicSharePlugin(Star):
                 python_exe, "-m", "yt_dlp",
                 f"ytsearch1:{song_name}",
                 "--dump-json", "--skip-download",
-                "--quiet", "--no-playlist",
-                "--no-warnings",
+                "--quiet", "--no-playlist", "--no-warnings",
             ]
             proxy = self.config_helper.proxy()
             if proxy:
@@ -317,7 +312,6 @@ class MusicSharePlugin(Star):
                     chat_provider_id=provider_id,
                     prompt=prompt,
                 )
-
                 answer = resp.completion_text.strip()
                 m = _re.search(r"\d+", answer)
                 if m:
@@ -346,14 +340,13 @@ class MusicSharePlugin(Star):
         m = _re.search(r'\[CQ:record,[^\]]*url=([^,\]]+)', raw_msg)
         if m:
             return m.group(1).strip()
-        # Try file path fallback
         m = _re.search(r'\[CQ:record,[^\]]*file=([^,\]]+)', raw_msg)
         if m:
             return m.group(1).strip()
         return None
 
     def _extract_record_from_reply(self, message_obj) -> Optional[Record]:
-        """Extract Record component from Reply.chain in a replied-to message."""
+        """Extract Record component from a replied-to message via Reply.chain."""
         if message_obj is None:
             return None
         for comp in message_obj.message:
@@ -363,6 +356,43 @@ class MusicSharePlugin(Star):
                     if c.type == ComponentType.Record:
                         return c
         return None
+
+    async def _find_latest_temp_wav(self) -> Optional[str]:
+        """Find the most recent media_audio_*.wav in AstrBot's temp directory."""
+        temp_dir = Path("/AstrBot/data/temp")
+        if not temp_dir.exists():
+            return None
+        wavs = sorted(
+            temp_dir.glob("media_audio_*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return str(wavs[0]) if wavs else None
+
+    async def _convert_to_wav(self, audio_path: str) -> Optional[str]:
+        """Convert AMR/SILK audio to WAV using ffmpeg."""
+        wav_path = str(Path(audio_path).with_suffix(".wav"))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", audio_path,
+                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                wav_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0 and Path(wav_path).exists():
+                return wav_path
+            logger.warning(
+                f"[MusicShare] ffmpeg failed: {stderr.decode('utf-8', errors='replace')[:200]}"
+            )
+            return None
+        except FileNotFoundError:
+            logger.warning("[MusicShare] ffmpeg not found, skip conversion")
+            return None
+        except Exception as e:
+            logger.warning(f"[MusicShare] ffmpeg error: {e}")
+            return None
 
     async def _handle_voice_recognition(self, event: AstrMessageEvent):
         """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
@@ -377,7 +407,7 @@ class MusicSharePlugin(Star):
             yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
             return
 
-        # Try to get Record from message_chain (works on most platforms)
+        # 1) Try to get Record from message_chain
         record = None
         try:
             message_chain = event.get_message_chain()
@@ -388,7 +418,7 @@ class MusicSharePlugin(Star):
         except Exception:
             pass
 
-        # Fallback: parse Record from raw outline
+        # 2) Fallback: parse Record from raw outline
         if not record:
             raw = event.get_message_outline() or ""
             if "[CQ:record" in raw:
@@ -396,42 +426,40 @@ class MusicSharePlugin(Star):
                 if url:
                     record = Record(file=url)
 
-        # Fallback 2: reply to a voice message — extract Record from Reply.chain
+        # 3) Fallback: reply to voice — extract Record from Reply.chain
         if not record:
             raw = event.get_message_outline() or ""
-            is_reply = "[CQ:reply" in raw
-            if is_reply:
+            if "[CQ:reply" in raw:
                 record = self._extract_record_from_reply(event.message_obj)
-                if not record:
-                    # Last resort: try AstrBot's auto-converted WAV
-                    wav_found = await self._find_latest_temp_wav()
-                    if wav_found:
-                        logger.info(f"[MusicShare] 使用 AstrBot 临时 WAV: {wav_found}")
-                        audio_path = wav_found
-                        title, artist = await self._acr_recognize(
-                            audio_path, host, access_key, access_secret
-                        )
-                        if not title:
-                            yield event.plain_result("未识别到歌曲，请确认引用的语音中包含清晰的原曲片段。")
-                            return
-                        logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
-                        yield event.plain_result(f"识别到歌曲: {title} - {artist}")
-                        info = await self._resolve_llm_song_info(f"{title} {artist}")
-                        if info and info.cover_url:
-                            async for result in self._send_cover_card(event, info):
-                                yield result
-                        expected_dur = info.duration if info else ""
-                        async for result in self._download_then_send(
-                            event, title, artist,
-                            expected_duration=expected_dur,
-                        ):
-                            yield result
+
+        # 4) Last resort: reply voice — grab AstrBot's auto-converted WAV
+        if not record:
+            raw = event.get_message_outline() or ""
+            if "[CQ:reply" in raw:
+                wav_found = await self._find_latest_temp_wav()
+                if wav_found:
+                    logger.info(f"[MusicShare] 使用 AstrBot 临时 WAV: {wav_found}")
+                    title, artist = await self._acr_recognize(
+                        wav_found, host, access_key, access_secret
+                    )
+                    if not title:
+                        yield event.plain_result("未识别到歌曲，请确认引用的语音中包含清晰的原曲片段。")
                         return
+                    logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
+                    yield event.plain_result(f"识别到歌曲: {title} - {artist}")
+                    info = await self._resolve_llm_song_info(f"{title} {artist}")
+                    if info and info.cover_url:
+                        async for result in self._send_cover_card(event, info):
+                            yield result
+                    expected_dur = info.duration if info else ""
+                    async for result in self._download_then_send(
+                        event, title, artist, expected_duration=expected_dur,
+                    ):
+                        yield result
+                    return
 
         if not record:
-            yield event.plain_result(
-                "未在消息中找到语音。请直接发送语音消息（而非引用回复），并附上「识歌」「什么歌」等文字。"
-            )
+            yield event.plain_result("未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。")
             return
 
         audio_path = None
@@ -440,14 +468,11 @@ class MusicSharePlugin(Star):
             audio_path = await record.convert_to_file_path()
             logger.info(f"[MusicShare] 语音文件已下载: {audio_path}")
 
-            # QQ 语音是 AMR/SILK 格式，需用 ffmpeg 转 WAV
-            wav_path = await self._convert_to_wav(audio_path)
-            if wav_path:
-                logger.info(f"[MusicShare] 音频已转码为 WAV: {wav_path}")
-            else:
-                wav_path = audio_path  # 转码失败则用原文件
+            wav_path = await self._convert_to_wav(audio_path) or audio_path
 
-            title, artist = await self._acr_recognize(wav_path, host, access_key, access_secret)
+            title, artist = await self._acr_recognize(
+                wav_path, host, access_key, access_secret
+            )
 
             if not title:
                 yield event.plain_result("未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
@@ -463,8 +488,7 @@ class MusicSharePlugin(Star):
 
             expected_dur = info.duration if info else ""
             async for result in self._download_then_send(
-                event, title, artist,
-                expected_duration=expected_dur,
+                event, title, artist, expected_duration=expected_dur,
             ):
                 yield result
 
@@ -477,47 +501,6 @@ class MusicSharePlugin(Star):
                     Path(audio_path).unlink(missing_ok=True)
                 except Exception:
                     pass
-
-    async def _find_latest_temp_wav(self) -> Optional[str]:
-        """Find the most recently created media_audio_*.wav in AstrBot's temp directory.
-        
-        AstrBot auto-converts voice messages to WAV at /AstrBot/data/temp/media_audio_*.wav
-        """
-        temp_dir = Path("/AstrBot/data/temp")
-        if not temp_dir.exists():
-            return None
-        wavs = sorted(
-            temp_dir.glob("media_audio_*.wav"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return str(wavs[0]) if wavs else None
-
-    async def _convert_to_wav(self, audio_path: str) -> Optional[str]:
-        """Convert AMR/SILK audio to WAV using ffmpeg."""
-        import uuid
-
-        wav_path = str(Path(audio_path).with_suffix(".wav"))
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-i", audio_path,
-                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                wav_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=15,
-            )
-            if proc.returncode == 0 and Path(wav_path).exists():
-                return wav_path
-            logger.warning(
-                f"[MusicShare] ffmpeg convert failed: {stderr.decode('utf-8', errors='replace')[:200]}"
-            )
-            return None
-        except Exception as e:
-            logger.warning(f"[MusicShare] ffmpeg not available or failed: {e}")
-            return None
 
     async def _acr_recognize(self, audio_path: str, host: str, access_key: str, access_secret: str):
         """Recognize song from audio using ACRCloud. Returns (title, artist) or (None, None)."""
@@ -562,23 +545,16 @@ class MusicSharePlugin(Star):
         try:
             proxy = self.config_helper.proxy() or ""
             card = await make_info_card(
-                song_info.cover_url,
-                song_info.title,
-                song_info.artist,
-                song_info.album,
-                song_info.source,
-                proxy,
-                duration=song_info.duration,
-                release_date=song_info.release_date,
+                song_info.cover_url, song_info.title, song_info.artist,
+                song_info.album, song_info.source, proxy,
+                duration=song_info.duration, release_date=song_info.release_date,
             )
             temp_dir = Path(self.config_helper.download_dir() or "data/music")
             temp_dir.mkdir(parents=True, exist_ok=True)
             safe_name = song_info.title[:20].replace("/", "_")
             card_path = temp_dir / f"cover_{safe_name}.png"
             card.save(str(card_path), "PNG")
-            yield event.set_result(
-                event.chain_result([Image.fromFileSystem(str(card_path))])
-            )
+            yield event.set_result(event.chain_result([Image.fromFileSystem(str(card_path))]))
             card_path.unlink()
         except Exception as e:
             logger.error(f"[MusicShare] 封面卡片生成失败: {e}")
@@ -588,8 +564,7 @@ class MusicSharePlugin(Star):
 
     async def _download_then_send(
         self, event: AstrMessageEvent, title: str, artist: str,
-        expected_duration: str = "",
-        force_mode: str = None,
+        expected_duration: str = "", force_mode: str = None,
     ):
         """Download audio and send voice + file."""
         download_dir = Path(StarTools.get_data_dir("music_share")) / "downloads"
@@ -618,10 +593,7 @@ class MusicSharePlugin(Star):
             return
 
         try:
-            if force_mode:
-                mode = force_mode
-            else:
-                mode = self.config_helper.send_mode()
+            mode = force_mode or self.config_helper.send_mode()
             record_sent = False
 
             if mode in ("仅语音", "都发送"):
@@ -630,15 +602,12 @@ class MusicSharePlugin(Star):
                     yield event.set_result(event.chain_result([record]))
                     record_sent = True
                 except Exception as e:
-                    logger.warning(
-                        f"[MusicShare] Record 发送失败，平台可能不支持语音消息: {e}"
-                    )
+                    logger.warning(f"[MusicShare] Record 发送失败: {e}")
                     if mode == "仅语音":
                         logger.info("[MusicShare] 回退为发送文件")
                         try:
                             file_b64 = file_to_base64(str(audio_file))
-                            file_component = File(name=audio_file.name, url=file_b64)
-                            yield event.set_result(event.chain_result([file_component]))
+                            yield event.set_result(event.chain_result([File(name=audio_file.name, url=file_b64)]))
                             record_sent = True
                         except Exception as fe:
                             logger.error(f"[MusicShare] 文件发送也失败: {fe}")
@@ -649,8 +618,7 @@ class MusicSharePlugin(Star):
             if mode in ("仅文件", "都发送"):
                 try:
                     file_b64 = file_to_base64(str(audio_file))
-                    file_component = File(name=audio_file.name, url=file_b64)
-                    yield event.set_result(event.chain_result([file_component]))
+                    yield event.set_result(event.chain_result([File(name=audio_file.name, url=file_b64)]))
                     record_sent = True
                 except Exception as e:
                     logger.error(f"[MusicShare] File 发送失败: {e}")
