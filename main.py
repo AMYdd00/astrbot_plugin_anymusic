@@ -111,6 +111,19 @@ class MusicSharePlugin(Star):
             if group_id and not self.config_helper.is_group_enabled(group_id):
                 return
 
+        # ── Voice recognition fallback: Record + keyword detection ──
+        if self.config_helper.voice_recognition_enabled():
+            msg_chain = event.get_message_chain()
+            has_record = any(c.type == ComponentType.Record for c in msg_chain)
+            if has_record:
+                text = event.message_str or ""
+                voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲", "识歌"]
+                if any(kw in text for kw in voice_keywords):
+                    logger.info("[MusicShare] 检测到语音识歌关键词，触发识别")
+                    async for result in self._handle_voice_recognition(event, msg_chain):
+                        yield result
+                    return
+
         message_text = event.message_str or ""
         result = extract_music_url(message_text)
         if result is None:
