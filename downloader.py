@@ -122,6 +122,11 @@ class MusicDownloader:
             raise RuntimeError(f"yt-dlp 搜索异常: {e}")
 
     async def _spotdl_search(self, query: str) -> Optional[List[Candidate]]:
+        # spotdl 4.5.0 在 Docker 无浏览器环境下无法完成 OAuth 认证，
+        # 即使配置了 Client ID/Secret 和 --headless 参数也会卡在认证流程直到超时。
+        # 暂时禁用，仅依赖 yt-dlp 单引擎搜索。
+        # 待上游修复后取消注释下面三行即可恢复双引擎。
+        return None
         client_id = self.config.spotify_client_id()
         client_secret = self.config.spotify_client_secret()
         if not client_id or not client_secret:
