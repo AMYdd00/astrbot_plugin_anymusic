@@ -122,8 +122,17 @@ class MusicDownloader:
             raise RuntimeError(f"yt-dlp 搜索异常: {e}")
 
     async def _spotdl_search(self, query: str) -> Optional[List[Candidate]]:
+        client_id = self.config.spotify_client_id()
+        client_secret = self.config.spotify_client_secret()
+        if not client_id or not client_secret:
+            raise RuntimeError("spotdl 未配置 Spotify 凭据，跳过（可在插件设置中填写免费凭据）")
+
         python_exe = self._find_python()
         if not python_exe: return None
+
+        # Write Spotify credentials to spotdl config
+        self._ensure_spotdl_config(client_id, client_secret)
+
         cmd = [python_exe, "-m", "spotdl", "save", query, "--save-file", "-"]
         proxy = self.config.proxy()
         if proxy: cmd.extend(["--proxy", proxy])
@@ -153,6 +162,27 @@ class MusicDownloader:
             raise
         except Exception as e:
             raise RuntimeError(f"spotdl 搜索异常: {e}")
+
+    @staticmethod
+    def _ensure_spotdl_config(client_id: str, client_secret: str):
+        """Write ~/.spotdl/config.json with Spotify OAuth credentials."""
+        import os as _os_module, json as _json_module
+        _os_module.makedirs(_os_module.path.expanduser("~/.spotdl"), exist_ok=True)
+        _config_path = _os_module.path.expanduser("~/.spotdl/config.json")
+        _config = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_token": None,
+            "user_auth": False,
+            "headless": True,
+            "cache_path": _os_module.path.expanduser("~/.spotdl/.spotipy"),
+            "no_cache": False,
+            "max_retries": 3,
+            "use_cache_file": False,
+        }
+        with open(_config_path, "w") as f:
+            _json_module.dump(_config, f)
+        logger.debug(f"[MusicShare] spotdl config written to {_config_path}")
 
     @staticmethod
     def _parse_duration(dur: str) -> float:

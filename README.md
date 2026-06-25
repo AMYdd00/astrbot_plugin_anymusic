@@ -2,7 +2,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/License-AGPLv3-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.3-blueviolet)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.4-blueviolet)](CHANGELOG.md)
 
 ## 简介
 
@@ -119,6 +119,8 @@ pip install yt-dlp spotdl beautifulsoup4 aiohttp Pillow
 | `acrcloud_host` | string | 空 | ACRCloud 服务地址，如 `identify-eu-west-1.acrcloud.com` |
 | `acrcloud_access_key` | string | 空 | ACRCloud Access Key |
 | `acrcloud_access_secret` | string | 空 | ACRCloud Access Secret |
+| `spotify_client_id` | string | 空 | Spotify Client ID，spotdl 搜索凭证（免费注册见下文） |
+| `spotify_client_secret` | string | 空 | Spotify Client Secret，spotdl 搜索凭证 |
 
 ## 使用
 
@@ -149,6 +151,31 @@ pip install yt-dlp spotdl beautifulsoup4 aiohttp Pillow
 > 免费额度为每天数百次识别，个人使用完全足够。
 > 
 > 注意：ACRCloud 对原曲片段识别精准，但对纯哼唱（无伴奏）支持较弱，建议发送包含原曲的语音。
+
+### 配置 Spotify API 凭据（可选）
+
+插件依赖 spotdl 进行 Spotify 歌曲搜索。由于 Spotify 收紧了未认证 API 请求限制，spotdl 4.5.0 开始需要配置 **Spotify Client ID 和 Client Secret** 才能正常工作。
+
+**免费注册步骤**：
+
+1. 访问 [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) 并登录你的 Spotify 账号（免费账号即可）
+2. 点击右上角 **Create app** 按钮
+3. 填写应用信息：
+   - **App name**：任意名称，如 `AnyMusic`
+   - **App description**：随意填写，如 `AstrBot music plugin`
+   - **Website**：填写 `https://github.com/AMYdd00/astrbot_plugin_anymusic`
+   - **Redirect URI**：填写 `http://localhost:8080/callback`（不会实际用到）
+   - 勾选 I understand and agree with Spotify's Developer Terms of Service
+4. 点击 **Save** 创建应用
+5. 进入应用详情页，点击右上角 **Settings**
+6. 找到 **Client ID** 和 **Client secret**（点击 View secret 查看）
+7. 回到插件配置页面，将这两项填入 `spotify_client_id` 和 `spotify_client_secret`
+8. 保存配置后，spotdl 搜索即可正常工作
+
+> **注意**：
+> - 免费账号每月有 API 调用次数限制，个人使用完全足够（每天数百次）
+> - 如果不想配置，插件会自动跳过 spotdl 搜索，仅使用 yt-dlp（功能不受影响，只是少了一个搜索源）
+> - 如遇问题，请检查代理设置是否允许访问 Spotify API 域名（`api.spotify.com`）
 
 ### 匹配精度说明
 
