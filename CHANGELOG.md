@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## [1.0.4] - 2026-06-25
+
+### Fixed
+- 修复 `cover_card.py` 艺术家行解包 bug 导致封面卡片不生成
+- 修复语音识歌误触发问题（关键字匹配改为仅 @bot + 语音触发）
+- 修复非 CQ 平台（QQ 官方）语音消息无法获取的问题
+- 修复 `file_to_base64` 导入路径适配 AstrBot v4.25+
+- 修复酷狗分享链接标题解析混乱（`_` → ` - `）
+- 修复 spotdl 搜索超时向用户报错（改为静默跳过）
+
+### Changed
+- 链接提取改为两阶段：通用 URL 正则 + 平台路由表匹配，覆盖更多分享格式
+- 语音缓存支持本地路径（兼容非 OneBot 平台）
+- ACRCloud 识别启用 BOTH 模式 + rec_length=12 + 文本元数据回退
+- `llm_search_provider` 配置项改为 `select_provider` 下拉选择
+- `_resolve_song_info` 封面缺失时用 yt-dlp 搜索缩略图作为回退
+
 ## [1.0.3] - 2026-06-22
 
 ### Added

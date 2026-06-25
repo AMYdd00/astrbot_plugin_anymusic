@@ -3,7 +3,7 @@ display_name: AnyMusic
 author: "AMYdd00"
 desc: "自动识别主流音乐平台分享链接，双引擎竞争下载高质量音频，支持 LLM 智能选歌、语音识歌与点歌。"
 short_desc: "全平台音乐解析 · 双引擎下载 · LLM 智能选歌 · 语音识歌"
-version: "1.0.3"
+version: "1.0.4"
 
 repo: "https://github.com/AMYdd00/astrbot_plugin_anymusic"
 support_platforms:
