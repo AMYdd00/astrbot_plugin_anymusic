@@ -511,7 +511,8 @@ class MusicSharePlugin(Star):
         access_secret = self.config_helper.acrcloud_access_secret()
 
         if not host or not access_key or not access_secret:
-            yield event.plain_result("语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。")
+            async for r in self._send_text(event, "语音识歌未配置 ACRCloud 密钥，请在插件设置中填写。免费注册见 README。"):
+                yield r
             return
 
         raw = event.get_message_outline() or ""
@@ -557,7 +558,8 @@ class MusicSharePlugin(Star):
                             should_clean = True
 
             if not audio_path:
-                yield event.plain_result("未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。")
+                async for r in self._send_text(event, "未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。"):
+                    yield r
                 return
 
             title, artist = await self._acr_recognize(
@@ -572,9 +574,8 @@ class MusicSharePlugin(Star):
                         f"[MusicShare] ACRCloud 失败，使用 caption 文本匹配: "
                         f"title={title}, artist={artist}"
                     )
-                    yield event.plain_result(
-                        f"音频指纹未匹配，尝试根据描述搜索: {title} {artist}".strip()
-                    )
+                    async for r in self._send_text(event, f"音频指纹未匹配，尝试根据描述搜索: {title} {artist}".strip()):
+                        yield r
 
             # ACRCloud + caption both failed — try QQ music metadata (source/character)
             if not title:
@@ -584,16 +585,17 @@ class MusicSharePlugin(Star):
                         f"[MusicShare] ACRCloud 失败，使用 QQ 元数据: "
                         f"title={title}, artist={artist}"
                     )
-                    yield event.plain_result(
-                        f"根据消息元数据搜索: {title} {artist}".strip()
-                    )
+                    async for r in self._send_text(event, f"根据消息元数据搜索: {title} {artist}".strip()):
+                        yield r
 
             if not title:
-                yield event.plain_result("未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
+                async for r in self._send_text(event, "未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。"):
+                    yield r
                 return
 
             logger.info(f"[MusicShare] ACRCloud 识别成功: {title} - {artist}")
-            yield event.plain_result(f"识别到歌曲: {title} - {artist}")
+            async for r in self._send_text(event, f"识别到歌曲: {title} - {artist}"):
+                yield r
 
             info = await self._resolve_llm_song_info(f"{title} {artist}")
             if info and info.cover_url:
@@ -608,7 +610,8 @@ class MusicSharePlugin(Star):
 
         except Exception as e:
             logger.error(f"[MusicShare] 语音识歌失败: {e}")
-            yield event.plain_result(f"语音识歌失败: {e}。该平台可能不支持语音消息接收。")
+            async for r in self._send_text(event, f"语音识歌失败: {e}。该平台可能不支持语音消息接收。"):
+                yield r
         finally:
             if audio_path and should_clean:
                 try:
@@ -688,8 +691,27 @@ class MusicSharePlugin(Star):
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    async def _send_cover_card(self, event: AstrMessageEvent, song_info: SongInfo):
-        """Generate and send the info card as an image."""
+    async def _send_text(self, event, text: str):
+        """Send plain text, compatible with AstrMessageEvent and ContextWrapper."""
+        try:
+            yield event.plain_result(text)
+        except AttributeError:
+            yield text
+
+    async def _send_chain(self, event, chain: list):
+        """Send message chain, compatible with AstrMessageEvent and ContextWrapper."""
+        try:
+            yield event.set_result(event.chain_result(chain))
+        except AttributeError:
+            # ContextWrapper (sub-agent) — use send_message instead
+            await self.context.send_message(event.unified_msg_origin, chain)
+            yield ""  # tool must yield something
+
+    async def _send_cover_card(self, event, song_info: SongInfo):
+        """Generate and send the info card as an image.
+        
+        Supports both AstrMessageEvent and ContextWrapper (sub-agent) event types.
+        """
         try:
             proxy = self.config_helper.proxy() or ""
             card = await make_info_card(
@@ -702,13 +724,23 @@ class MusicSharePlugin(Star):
             safe_name = song_info.title[:20].replace("/", "_")
             card_path = temp_dir / f"cover_{safe_name}.png"
             card.save(str(card_path), "PNG")
-            yield event.set_result(event.chain_result([Image.fromFileSystem(str(card_path))]))
+            try:
+                yield event.set_result(event.chain_result([Image.fromFileSystem(str(card_path))]))
+            except AttributeError:
+                # ContextWrapper (sub-agent) — use send_message instead
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    [Image.fromFileSystem(str(card_path))],
+                )
+                yield ""  # tool must yield something
             card_path.unlink()
         except Exception as e:
             logger.error(f"[MusicShare] 封面卡片生成失败: {e}")
-            yield event.plain_result(
-                f"歌名: {song_info.title}\n艺术家: {song_info.artist}\n来源: {song_info.source}"
-            )
+            fallback = f"歌名: {song_info.title}\n艺术家: {song_info.artist}\n来源: {song_info.source}"
+            try:
+                yield event.plain_result(fallback)
+            except AttributeError:
+                yield fallback
 
     async def _download_then_send(
         self, event: AstrMessageEvent, title: str, artist: str,
@@ -731,13 +763,15 @@ class MusicSharePlugin(Star):
         )
 
         if not audio_file:
-            yield event.plain_result(error_msg or f"未找到匹配的歌曲: {title} {artist}".strip())
+            async for r in self._send_text(event, error_msg or f"未找到匹配的歌曲: {title} {artist}".strip()):
+                yield r
             return
 
         file_size_mb = audio_file.stat().st_size / (1024 * 1024)
         if file_size_mb > self.config_helper.max_file_size_mb():
             self.downloader.clean_file(audio_file)
-            yield event.plain_result(f"音频文件过大 ({file_size_mb:.1f}MB)")
+            async for r in self._send_text(event, f"音频文件过大 ({file_size_mb:.1f}MB)"):
+                yield r
             return
 
         try:
@@ -747,7 +781,8 @@ class MusicSharePlugin(Star):
             if mode in ("仅语音", "都发送"):
                 try:
                     record = Record.fromFileSystem(str(audio_file))
-                    yield event.set_result(event.chain_result([record]))
+                    async for r in self._send_chain(event, [record]):
+                        yield r
                     record_sent = True
                 except Exception as e:
                     logger.warning(f"[MusicShare] Record 发送失败: {e}")
@@ -755,27 +790,32 @@ class MusicSharePlugin(Star):
                         logger.info("[MusicShare] 回退为发送文件")
                         try:
                             file_b64 = file_to_base64(str(audio_file))
-                            yield event.set_result(event.chain_result([File(name=audio_file.name, url=file_b64)]))
+                            async for r in self._send_chain(event, [File(name=audio_file.name, url=file_b64)]):
+                                yield r
                             record_sent = True
                         except Exception as fe:
                             logger.error(f"[MusicShare] 文件发送也失败: {fe}")
-                            yield event.plain_result(f"发送失败: {fe}")
+                            async for r in self._send_text(event, f"发送失败: {fe}"):
+                                yield r
                     else:
                         logger.info("[MusicShare] Record 失败但仍会尝试发送 File")
 
             if mode in ("仅文件", "都发送"):
                 try:
                     file_b64 = file_to_base64(str(audio_file))
-                    yield event.set_result(event.chain_result([File(name=audio_file.name, url=file_b64)]))
+                    async for r in self._send_chain(event, [File(name=audio_file.name, url=file_b64)]):
+                        yield r
                     record_sent = True
                 except Exception as e:
                     logger.error(f"[MusicShare] File 发送失败: {e}")
                     if not record_sent:
-                        yield event.plain_result(f"发送失败: {e}")
+                        async for r in self._send_text(event, f"发送失败: {e}"):
+                            yield r
 
             logger.info(f"[MusicShare] 已发送: {audio_file.name} (mode={mode})")
         except Exception as e:
             logger.error(f"[MusicShare] 发送失败: {e}")
-            yield event.plain_result(f"发送失败: {e}")
+            async for r in self._send_text(event, f"发送失败: {e}"):
+                yield r
 
         self.downloader.clean_file(audio_file)
