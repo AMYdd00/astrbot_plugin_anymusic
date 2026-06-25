@@ -340,8 +340,12 @@ class MusicSharePlugin(Star):
             try:
                 provider_id = self.config_helper.llm_search_provider()
                 if not provider_id:
-                    umo = event.unified_msg_origin
-                    provider_id = await self.context.get_current_chat_provider_id(umo)
+                    try:
+                        umo = event.unified_msg_origin
+                        provider_id = await self.context.get_current_chat_provider_id(umo)
+                    except AttributeError:
+                        # ContextWrapper (sub-agent) — use default provider
+                        provider_id = ""
 
                 cand_lines = []
                 for i, c in enumerate(candidates):
@@ -703,9 +707,8 @@ class MusicSharePlugin(Star):
         try:
             yield event.set_result(event.chain_result(chain))
         except AttributeError:
-            # ContextWrapper (sub-agent) — use send_message instead
-            await self.context.send_message(event.unified_msg_origin, chain)
-            yield ""  # tool must yield something
+            # ContextWrapper (sub-agent) — rich media not supported, yield empty
+            yield ""
 
     async def _send_cover_card(self, event, song_info: SongInfo):
         """Generate and send the info card as an image.
@@ -727,12 +730,8 @@ class MusicSharePlugin(Star):
             try:
                 yield event.set_result(event.chain_result([Image.fromFileSystem(str(card_path))]))
             except AttributeError:
-                # ContextWrapper (sub-agent) — use send_message instead
-                await self.context.send_message(
-                    event.unified_msg_origin,
-                    [Image.fromFileSystem(str(card_path))],
-                )
-                yield ""  # tool must yield something
+                # ContextWrapper (sub-agent) — cover cards not supported, yield empty
+                yield ""
             card_path.unlink()
         except Exception as e:
             logger.error(f"[MusicShare] 封面卡片生成失败: {e}")
