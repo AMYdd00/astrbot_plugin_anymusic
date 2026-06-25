@@ -9,6 +9,7 @@ import json
 import os
 import re as _re
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -21,9 +22,9 @@ from astrbot.api.message_components import (
     File,
     Image,
     Record,
-    file_to_base64,
 )
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.utils.io import file_to_base64
 
 from .config import ConfigHelper
 from .cover_card import make_info_card
@@ -52,8 +53,8 @@ class MusicSharePlugin(Star):
         self.spotify_parser = SpotifyParser()
         self.downloader = MusicDownloader(self.config_helper)
         self._cache = ResultCache(ttl_seconds=600)
-        # Voice URL cache: {(group_id, user_id): (url, timestamp)}
-        self._voice_url_cache: dict[str, tuple[str, float]] = {}
+        # Voice cache per group: {"url": str, "path": str, "ts": float}
+        self._voice_cache: dict[str, dict] = {}
         self._voice_cache_ttl = 120
 
     # ── LLM Tool: search_song ────────────────────────────────────────────
@@ -116,21 +117,43 @@ class MusicSharePlugin(Star):
         message_text = event.message_str or ""
         raw = event.get_message_outline() or ""
 
-        # ── Cache voice URL whenever a voice message is sent ──
-        if self.config_helper.voice_recognition_enabled() and "[CQ:record" in raw:
-            url = self._parse_record_url_from_raw(raw)
-            if url:
-                session_key = self._get_voice_session_key(event)
-                if session_key:
-                    self._voice_url_cache[session_key] = (url, time.time())
-                    logger.info(f"[MusicShare] 缓存语音 URL for {session_key}")
+        # ── Cache voice data per group whenever a voice message is sent ──
+        gid = None
+        if is_group_event(event):
+            try:
+                gid = str(event.get_group_id())
+            except Exception:
+                pass
 
-        # ── Voice recognition: keyword detection ──
-        if self.config_helper.voice_recognition_enabled():
+        if gid and self.config_helper.voice_recognition_enabled():
+            # Try CQ code first (OneBot v11)
+            if "[CQ:record" in raw:
+                url = self._parse_record_url_from_raw(raw)
+                if url:
+                    self._voice_cache[gid] = {"url": url, "ts": time.time()}
+                    logger.info(f"[MusicShare] 缓存语音 URL (CQ) for group {gid}")
+            else:
+                # Try message chain Record (QQ Official / other platforms)
+                record_comp = self._extract_record_from_chain(event)
+                if record_comp:
+                    try:
+                        path = await record_comp.convert_to_file_path()
+                        self._voice_cache[gid] = {"path": path, "ts": time.time()}
+                        logger.info(f"[MusicShare] 缓存语音路径 (chain) for group {gid}: {path}")
+                    except Exception as e:
+                        logger.warning(f"[MusicShare] 缓存语音路径失败: {e}")
+
+        # ── Voice recognition: @bot + voice/reply-to-voice only ──
+        if self.config_helper.voice_recognition_enabled() and event.is_wake_up():
             has_record = "[CQ:record" in raw
-            voice_keywords = ["识歌", "什么歌", "识别", "听歌识曲", "识曲"]
-            if has_record or any(kw in message_text for kw in voice_keywords):
-                logger.info("[MusicShare] 检测到语音识歌触发条件")
+            if not has_record:
+                has_record = self._extract_record_from_chain(event) is not None
+            has_reply_to_voice = (
+                not has_record
+                and self._extract_record_from_reply(event.message_obj) is not None
+            )
+            if has_record or has_reply_to_voice:
+                logger.info(f"[MusicShare] 检测到@bot+语音，进入识曲")
                 async for result in self._handle_voice_recognition(event):
                     yield result
                 return
@@ -186,10 +209,24 @@ class MusicSharePlugin(Star):
         ):
             data = await parse_html_title(url, proxy)
             if data:
+                cover_url = data.get("cover_url", "")
+                # Domestic share pages often lack og:image → fallback to yt-dlp thumbnail
+                if not cover_url and data["title"]:
+                    try:
+                        llm_info = await self._resolve_llm_song_info(
+                            f"{data['title']} {data.get('artist', '')}"
+                        )
+                        if llm_info and llm_info.cover_url:
+                            cover_url = llm_info.cover_url
+                            logger.info(
+                                f"[MusicShare] 用 yt-dlp 获取缩略图: {cover_url[:80]}"
+                            )
+                    except Exception:
+                        pass
                 return SongInfo(
                     title=data["title"],
                     artist=data.get("artist", ""),
-                    cover_url=data.get("cover_url", ""),
+                    cover_url=cover_url,
                     source=platform.name.lower(),
                 )
             return None
@@ -350,17 +387,31 @@ class MusicSharePlugin(Star):
 
     # ── Voice Recognition ─────────────────────────────────────────────────
 
-    def _get_voice_session_key(self, event: AstrMessageEvent) -> Optional[str]:
-        """Build a unique session key for voice URL caching: group_id:user_id."""
+    def _extract_record_from_chain(self, event: AstrMessageEvent):
+        """Extract Record component from the event's message chain, if any."""
         try:
-            gid = str(event.get_group_id()) if is_group_event(event) else "private"
+            message_chain = event.get_message_chain()
+            for comp in message_chain:
+                if comp.type == ComponentType.Record:
+                    return comp
         except Exception:
-            gid = "private"
-        try:
-            uid = str(event.get_sender_id())
-        except Exception:
+            pass
+        return None
+
+    def _extract_record_from_reply(self, message_obj):
+        """Extract Record component from a Reply message's chain."""
+        if not message_obj:
             return None
-        return f"{gid}:{uid}"
+        try:
+            for comp in message_obj.message:
+                if comp.type == ComponentType.Reply:
+                    reply_chain = getattr(comp, 'chain', None) or []
+                    for rc in reply_chain:
+                        if rc.type == ComponentType.Record:
+                            return rc
+        except Exception:
+            pass
+        return None
 
     def _parse_record_url_from_raw(self, raw_msg: str) -> Optional[str]:
         """Extract the audio file URL from a CQ record code in raw message."""
@@ -372,17 +423,59 @@ class MusicSharePlugin(Star):
             return m.group(1).strip()
         return None
 
-    def _get_cached_voice_url(self, event: AstrMessageEvent) -> Optional[str]:
-        """Get cached voice URL for this session (reply fallback)."""
-        session_key = self._get_voice_session_key(event)
-        if not session_key:
+    def _extract_reply_caption(self, message_obj) -> str:
+        """Extract text description from a Reply context (LLM caption of the voice)."""
+        if not message_obj:
+            return ""
+        try:
+            for comp in message_obj.message:
+                if comp.type == ComponentType.Reply:
+                    reply_text = getattr(comp, 'message_str', '') or ''
+                    if reply_text:
+                        return reply_text.strip()
+        except Exception:
+            pass
+        return ""
+
+    def _extract_song_meta_from_event(self, event: AstrMessageEvent) -> tuple:
+        """Extract song title/artist from QQ music share message metadata.
+        
+        QQ music voice messages carry 'source' (song name) and 'character' (artist) 
+        fields in the raw data. Returns (title, artist) or ("", "").
+        """
+        try:
+            # Try raw_message on the message_obj (QQ Official attaches metadata here)
+            raw = getattr(event.message_obj, 'raw_message', None)
+            if raw and isinstance(raw, dict):
+                src = raw.get('source', '') or ''
+                char = raw.get('character', '') or ''
+                if src:
+                    logger.info(f"[MusicShare] 从 raw_message 元数据提取: source={src}, character={char}")
+                    return src.strip(), char.strip()
+        except Exception:
+            pass
+        return "", ""
+
+    @staticmethod
+    def _parse_title_artist_from_text(text: str) -> tuple:
+        """Parse title and artist from a free-form text like '光るなら - Goose house'."""
+        text = text.strip()
+        # Pattern: "Song - Artist" or "Song by Artist"
+        for sep in (' - ', ' – ', ' — ', ' by ', ' / '):
+            if sep in text:
+                parts = text.rsplit(sep, 1)
+                return parts[0].strip(), parts[1].strip()
+        return text, ""
+
+    def _get_cached_voice(self, event: AstrMessageEvent) -> Optional[str]:
+        """Get cached voice URL or file path for this group (reply fallback)."""
+        try:
+            gid = str(event.get_group_id())
+        except Exception:
             return None
-        entry = self._voice_url_cache.get(session_key)
-        if entry:
-            url, ts = entry
-            if time.time() - ts < self._voice_cache_ttl:
-                return url
-            del self._voice_url_cache[session_key]
+        entry = self._voice_cache.get(gid)
+        if entry and time.time() - entry["ts"] < self._voice_cache_ttl:
+            return entry.get("url") or entry.get("path")
         return None
 
     async def _download_voice_url(self, url: str) -> Optional[str]:
@@ -410,8 +503,6 @@ class MusicSharePlugin(Star):
 
     async def _handle_voice_recognition(self, event: AstrMessageEvent):
         """Handle voice recognition: download audio, recognize via ACRCloud, then download song."""
-        import uuid
-
         if not self.config_helper.voice_recognition_enabled():
             return
 
@@ -429,16 +520,7 @@ class MusicSharePlugin(Star):
 
         try:
             # 1) Direct voice message — Record in message_chain
-            record = None
-            try:
-                message_chain = event.get_message_chain()
-                for comp in message_chain:
-                    if comp.type == ComponentType.Record:
-                        record = comp
-                        break
-            except Exception:
-                pass
-
+            record = self._extract_record_from_chain(event)
             if record:
                 audio_path = await record.convert_to_file_path()
                 logger.info(f"[MusicShare] 语音文件已下载 (chain): {audio_path}")
@@ -451,13 +533,28 @@ class MusicSharePlugin(Star):
                     audio_path = await self._download_voice_url(url)
                     should_clean = True
 
-            # 3) Reply to a voice — try cached URL
-            if not audio_path and "[CQ:reply" in raw:
-                cached_url = self._get_cached_voice_url(event)
-                if cached_url:
-                    logger.info(f"[MusicShare] 下载语音 URL (cached): {cached_url}")
-                    audio_path = await self._download_voice_url(cached_url)
-                    should_clean = True
+            # 3) Reply to a voice — extract Record from Reply.chain
+            reply_caption = ""
+            if not audio_path:
+                record = self._extract_record_from_reply(event.message_obj)
+                if record:
+                    audio_path = await record.convert_to_file_path()
+                    logger.info(f"[MusicShare] 语音文件已下载 (reply.chain): {audio_path}")
+                # Also try to get caption from Reply context (LLM description of the voice)
+                reply_caption = self._extract_reply_caption(event.message_obj)
+                if reply_caption:
+                    logger.info(f"[MusicShare] 从引用中提取到 caption: {reply_caption[:100]}")
+                # Fallback: try cached URL or local path
+                if not audio_path:
+                    cached = self._get_cached_voice(event)
+                    if cached:
+                        if os.path.exists(cached):
+                            audio_path = cached
+                            logger.info(f"[MusicShare] 使用缓存语音路径: {audio_path}")
+                        else:
+                            logger.info(f"[MusicShare] 下载语音 URL (cached): {cached}")
+                            audio_path = await self._download_voice_url(cached)
+                            should_clean = True
 
             if not audio_path:
                 yield event.plain_result("未在消息中找到语音。请直接发送语音消息并附上「识歌」「什么歌」等文字。")
@@ -466,6 +563,30 @@ class MusicSharePlugin(Star):
             title, artist = await self._acr_recognize(
                 audio_path, host, access_key, access_secret
             )
+
+            # ACRCloud fingerprint failed — try text-based fallback from reply caption
+            if not title and reply_caption:
+                title, artist = self._parse_title_artist_from_text(reply_caption)
+                if title:
+                    logger.info(
+                        f"[MusicShare] ACRCloud 失败，使用 caption 文本匹配: "
+                        f"title={title}, artist={artist}"
+                    )
+                    yield event.plain_result(
+                        f"音频指纹未匹配，尝试根据描述搜索: {title} {artist}".strip()
+                    )
+
+            # ACRCloud + caption both failed — try QQ music metadata (source/character)
+            if not title:
+                title, artist = self._extract_song_meta_from_event(event)
+                if title:
+                    logger.info(
+                        f"[MusicShare] ACRCloud 失败，使用 QQ 元数据: "
+                        f"title={title}, artist={artist}"
+                    )
+                    yield event.plain_result(
+                        f"根据消息元数据搜索: {title} {artist}".strip()
+                    )
 
             if not title:
                 yield event.plain_result("未识别到歌曲，请确认语音中包含清晰的原曲片段，而非哼唱。")
@@ -496,32 +617,66 @@ class MusicSharePlugin(Star):
                     pass
 
     async def _acr_recognize(self, audio_path: str, host: str, access_key: str, access_secret: str):
-        """Recognize song from audio using ACRCloud. Returns (title, artist) or (None, None)."""
+        """Recognize song from audio using ACRCloud. Returns (title, artist) or (None, None).
+        
+        Uses recognize_type=BOTH (audio fingerprint + humming) for best chance of matching
+        compressed/low-quality audio like QQ voice messages.
+        Retains original sample rate — ACRCloud SDK handles conversion internally.
+        """
         try:
-            from acrcloud.recognizer import ACRCloudRecognizer
+            from acrcloud.recognizer import ACRCloudRecognizer, ACRCloudRecognizeType
+            import os as _os_local
+            
+            file_size = _os_local.path.getsize(audio_path)
+            logger.info(
+                f"[MusicShare] 准备 ACRCloud 识别: file={Path(audio_path).name}, "
+                f"size={file_size} bytes"
+            )
 
             config = {
                 'host': host,
                 'access_key': access_key,
                 'access_secret': access_secret,
                 'timeout': 10,
+                # BOTH mode: tries audio fingerprint first, falls back to humming
+                'recognize_type': ACRCloudRecognizeType.ACR_OPT_REC_BOTH,
             }
 
             def _recognize():
                 recognizer = ACRCloudRecognizer(config)
-                result_str = recognizer.recognize_by_file(audio_path, 0)
-                return json.loads(result_str)
+                # rec_length=12: use up to 12 seconds of audio for better matching
+                return recognizer.recognize_by_file(audio_path, 0, rec_length=12)
 
-            result = await asyncio.to_thread(_recognize)
+            result_str = await asyncio.to_thread(_recognize)
+            result = json.loads(result_str)
+            
+            status_code = result.get("status", {}).get("code")
+            status_msg = result.get("status", {}).get("msg", "")
+            logger.info(
+                f"[MusicShare] ACRCloud 识别结果: status={status_code}, "
+                f"msg={status_msg}"
+            )
 
-            if result.get("status", {}).get("code") == 0:
+            if status_code == 0:
                 music_list = result.get("metadata", {}).get("music", [])
                 if music_list:
                     music = music_list[0]
                     title = music.get("title", "")
                     artists = music.get("artists", [])
                     artist = artists[0].get("name", "") if artists else ""
+                    score = music.get("score", 0)
+                    logger.info(
+                        f"[MusicShare] ACRCloud 命中: {title} - {artist} (score={score})"
+                    )
                     return title, artist
+                else:
+                    logger.warning("[MusicShare] ACRCloud status=0 但无 music 结果")
+            elif status_code == 1001:
+                logger.warning("[MusicShare] ACRCloud 无匹配结果 (1001: No result)")
+            elif status_code == 3003:
+                logger.warning("[MusicShare] ACRCloud 配额用完 (3003)")
+            else:
+                logger.warning(f"[MusicShare] ACRCloud 返回非预期状态: code={status_code}, msg={status_msg}")
 
             return None, None
         except ImportError:

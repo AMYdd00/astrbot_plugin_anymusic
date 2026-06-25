@@ -90,9 +90,10 @@
   },
   "llm_search_provider": {
     "type": "string",
-    "description": "LLM 智能选歌提供商ID",
-    "hint": "指定用于选歌的 LLM 提供商ID（需在 AI 配置中已添加对应提供商），留空则使用当前会话默认提供商。",
-    "default": ""
+    "description": "LLM 智能选歌提供商",
+    "hint": "指定用于选歌的 LLM 提供商，留空则使用当前会话默认提供商。",
+    "default": "",
+    "_special": "select_provider"
   },
   "enable_voice_recognition": {
     "type": "bool",

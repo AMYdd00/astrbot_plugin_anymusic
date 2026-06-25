@@ -131,15 +131,26 @@ _ROUTES: list[tuple[re.Pattern, Platform]] = [
 ]
 
 
+# ── Generic URL extraction ─────────────────────────────────────────
+# Matches any http/https URL until whitespace or common delimiters
+_URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+", re.IGNORECASE)
+
+
 def extract_music_url(text: str) -> Optional[Tuple[str, Platform]]:
     """Extract the first music share URL from a message text.
 
+    Strategy: first extract all URLs from the text with a generic regex,
+    then match each URL against the platform routing table.
+    This handles complex share formats like
+    「绫华分享童可可的单曲《补妆》https://m.kugou.com/share/song.html?... (@酷狗音乐)」
+
     Returns (url, platform) if found, None otherwise.
     """
-    for regex, platform in _ROUTES:
-        m = regex.search(text)
-        if m:
-            return m.group(0), platform
+    for url_match in _URL_RE.finditer(text):
+        url = url_match.group(0).rstrip(".,;:!?）)】』")
+        for regex, platform in _ROUTES:
+            if regex.search(url):
+                return url, platform
     return None
 
 
@@ -156,8 +167,12 @@ def is_group_event(event) -> bool:
 # These platforms don't have structured JSON-LD; we parse <title> and
 # clean away platform suffixes.
 
-_TITLE_CLEANERS = [
+_TITLE_CLEANERS: list[tuple[re.Pattern, str]] = [
     # Order matters: remove longer/more-specific first
+    # Kugou: "童可可_童可可补妆高品质MV首发|童可可 - 酷狗音乐"
+    #   → replace _ with " - " first, then strip Kugou-specific suffixes
+    (re.compile(r"高品质MV首发\|.*$", re.IGNORECASE), ""),
+    (re.compile(r"_\s*", re.IGNORECASE), " - "),
     (re.compile(r"\s*[-_—–]\s*高清在线试听\s*$", re.IGNORECASE), ""),
     (re.compile(r"\s*[-_—–]\s*单曲\s*[-_—–]\s*网易云音乐\s*$", re.IGNORECASE), ""),
     (re.compile(r"\s*[-_—–]\s*网易云音乐\s*$", re.IGNORECASE), ""),

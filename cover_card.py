@@ -310,7 +310,7 @@ async def make_info_card(
     # Artist — center, auto-scale font, truncate with ellipsis
     artist_prefix = "艺术家  "
     artist_full = artist_prefix + artist
-    artist_lines, artist_font = _fit_text(
+    artist_lines = _fit_text(
         artist_full, font_sub, TEXT_MAX_W, min_size=18, max_lines=2
     )
     for line, line_font in artist_lines:
