@@ -68,19 +68,58 @@ class MusicDownloader:
         return filepath, ""
 
     async def _search_meta(self, query: str) -> Tuple[List[Candidate], List[str]]:
-        results = await asyncio.gather(
-            self._ytdlp_search(query), self._spotdl_search(query),
-            return_exceptions=True,
-        )
+        """双引擎竞速搜索：yt-dlp 必须完成，spotdl 作为补充最多额外等 10 秒。
+
+        yt-dlp 先返回 → 单引擎候选用；spotdl 在 10 秒内也返回 → 合并提高匹配精度。
+        spotdl 超时或失败不阻塞整体流程。
+        """
+        SPOTDL_GRACE_SECS = 10
+
         candidates: List[Candidate] = []
         errors: List[str] = []
-        for i, r in enumerate(results):
-            engine = "yt-dlp" if i == 0 else "spotdl"
-            if isinstance(r, Exception):
-                errors.append(f"{engine}: {r}")
-                logger.warning(f"[MusicShare] {engine} search error: {r}")
-            elif r is not None:
-                candidates.extend(r)
+
+        ytdlp_task = asyncio.create_task(self._ytdlp_search(query))
+        spotdl_task = asyncio.create_task(self._spotdl_search(query))
+
+        # 1) 等 yt-dlp（使用用户配置的 search_timeout，必须完成）
+        try:
+            ytdlp_result = await ytdlp_task
+            if ytdlp_result:
+                candidates.extend(ytdlp_result)
+        except Exception as e:
+            errors.append(f"yt-dlp: {e}")
+            logger.warning(f"[MusicShare] yt-dlp search error: {e}")
+
+        # 2) yt-dlp 完成后，spotdl 可能：已完成 / 还在跑 / 已抛异常
+        if spotdl_task.done():
+            try:
+                spotdl_result = spotdl_task.result()
+                if spotdl_result:
+                    candidates.extend(spotdl_result)
+            except Exception as e:
+                errors.append(f"spotdl: {e}")
+                logger.warning(f"[MusicShare] spotdl search error: {e}")
+        else:
+            try:
+                spotdl_result = await asyncio.wait_for(
+                    spotdl_task, timeout=SPOTDL_GRACE_SECS,
+                )
+                if spotdl_result:
+                    candidates.extend(spotdl_result)
+            except asyncio.TimeoutError:
+                spotdl_task.cancel()
+                try:
+                    await spotdl_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                logger.info(
+                    f"[MusicShare] spotdl 未在 {SPOTDL_GRACE_SECS}s 内返回，"
+                    f"仅使用 yt-dlp 结果"
+                )
+            except Exception as e:
+                errors.append(f"spotdl: {e}")
+                logger.warning(f"[MusicShare] spotdl search error: {e}")
+
         return candidates, errors
 
     async def _ytdlp_search(self, query: str) -> Optional[List[Candidate]]:
@@ -122,11 +161,6 @@ class MusicDownloader:
             raise RuntimeError(f"yt-dlp 搜索异常: {e}")
 
     async def _spotdl_search(self, query: str) -> Optional[List[Candidate]]:
-        # spotdl 4.5.0 在 Docker 无浏览器环境下无法完成 OAuth 认证，
-        # 即使配置了 Client ID/Secret 和 --headless 参数也会卡在认证流程直到超时。
-        # 暂时禁用，仅依赖 yt-dlp 单引擎搜索。
-        # 待上游修复后取消注释下面三行即可恢复双引擎。
-        return None
         client_id = self.config.spotify_client_id()
         client_secret = self.config.spotify_client_secret()
         if not client_id or not client_secret:
@@ -138,7 +172,12 @@ class MusicDownloader:
         # Write Spotify credentials to spotdl config
         self._ensure_spotdl_config(client_id, client_secret)
 
-        cmd = [python_exe, "-m", "spotdl", "save", query, "--save-file", "-"]
+        cmd = [
+            python_exe, "-m", "spotdl", "save", query, "--save-file", "-",
+            "--headless",
+            "--client-id", client_id,
+            "--client-secret", client_secret,
+        ]
         proxy = self.config.proxy()
         if proxy: cmd.extend(["--proxy", proxy])
         try:
