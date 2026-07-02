@@ -707,8 +707,8 @@ class MusicSharePlugin(Star):
         try:
             yield event.set_result(event.chain_result(chain))
         except AttributeError:
-            # ContextWrapper (sub-agent) — rich media not supported, yield empty
-            yield ""
+            # ContextWrapper lacks unified_msg_origin; yield text for LLM
+            yield "[已发送语音/文件]"
 
     async def _send_cover_card(self, event, song_info: SongInfo):
         """Generate and send the info card as an image.
@@ -730,8 +730,8 @@ class MusicSharePlugin(Star):
             try:
                 yield event.set_result(event.chain_result([Image.fromFileSystem(str(card_path))]))
             except AttributeError:
-                # ContextWrapper (sub-agent) — cover cards not supported, yield empty
-                yield ""
+                # ContextWrapper lacks unified_msg_origin; yield text for LLM
+                yield "[已发送封面卡片]"
             card_path.unlink()
         except Exception as e:
             logger.error(f"[MusicShare] 封面卡片生成失败: {e}")
