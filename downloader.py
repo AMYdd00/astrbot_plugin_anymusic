@@ -61,7 +61,7 @@ class MusicDownloader:
                 f"[MusicShare] Selected: {best.title!r} ({best.source}, "
                 f"{best.duration}s vs expected {expected_secs}s)"
             )
-        filepath, dl_err = await self._download(best, download_dir)
+        filepath, dl_err = await self._download(best, download_dir, title, artist)
         if not filepath:
             return None, dl_err or "下载失败"
         return filepath, ""
@@ -295,12 +295,15 @@ class MusicDownloader:
             if total > best_score: best_score, best = total, cand
         return best
 
-    async def _download(self, cand: Candidate, download_dir: Path) -> Tuple[Optional[Path], str]:
+    async def _download(
+        self, cand: Candidate, download_dir: Path,
+        original_title: str = "", original_artist: str = "",
+    ) -> Tuple[Optional[Path], str]:
         """Download audio for a candidate.
 
         - spotdl candidates with spotify_url: use spotdl download (best accuracy)
         - spotdl/yt-dlp candidates with yt_id: use yt-dlp
-        - all others: use yt-dlp ytsearch
+        - Fallback: ytsearch with original_title + original_artist
         """
         output_template = str(download_dir / "%(title)s.%(ext)s")
         python_exe = self._find_python()
@@ -310,6 +313,7 @@ class MusicDownloader:
         if cand.source == "spotdl" and cand.spotify_url:
             return await self._download_via_spotdl(
                 cand.spotify_url, output_template, download_dir,
+                original_title, original_artist,
             )
 
         # Try direct YouTube ID download first
@@ -323,14 +327,20 @@ class MusicDownloader:
             if filepath:
                 return filepath, ""
 
-            # Direct ID failed (deleted/restricted video) → fallback to search
             logger.info(
-                f"[MusicShare] ID download failed ({err[:60]}), "
-                f"retrying with ytsearch1:{cand.title[:40]}"
+                f"[MusicShare] ID download failed ({err[:60]}), falling back to search"
             )
 
-        # Last resort: search by title
-        query = f"ytsearch1:{cand.title}"
+        # Fallback: search by original title+artist (not candidate title)
+        fallback_query = f"{original_title} {original_artist}".strip()
+        if not fallback_query:
+            fallback_query = cand.title
+        fallback_query = re.sub(r'[<>|"&!$`]', "", fallback_query).strip()
+
+        logger.info(
+            f"[MusicShare] Retrying with ytsearch3: {fallback_query[:60]}"
+        )
+        query = f"ytsearch3:{fallback_query}"
         filepath, err = await self._download_via_ytdlp(query, output_template)
         if filepath:
             return filepath, ""
@@ -338,6 +348,7 @@ class MusicDownloader:
 
     async def _download_via_spotdl(
         self, spotify_url: str, output_template: str, download_dir: Path,
+        original_title: str = "", original_artist: str = "",
     ) -> Tuple[Optional[Path], str]:
         """Download via spotdl from a Spotify URL.  Falls back to yt-dlp on failure."""
         python_exe = self._find_python()
@@ -389,17 +400,17 @@ class MusicDownloader:
                 logger.warning(
                     f"[MusicShare] spotdl download failed, fallback yt-dlp: {stderr_text[:100]}"
                 )
-            track_id = spotify_url.rstrip("/").split("/")[-1]
-            return await self._download_via_ytdlp(f"ytsearch1:{track_id}", output_template)
+            fallback = self._fallback_query(original_title, original_artist)
+            return await self._download_via_ytdlp(f"ytsearch3:{fallback}", output_template)
 
         except asyncio.TimeoutError:
             logger.warning("[MusicShare] spotdl download timeout, fallback yt-dlp")
-            track_id = spotify_url.rstrip("/").split("/")[-1]
-            return await self._download_via_ytdlp(f"ytsearch1:{track_id}", output_template)
+            fallback = self._fallback_query(original_title, original_artist)
+            return await self._download_via_ytdlp(f"ytsearch3:{fallback}", output_template)
         except Exception as e:
             logger.warning(f"[MusicShare] spotdl download error: {e}, fallback yt-dlp")
-            track_id = spotify_url.rstrip("/").split("/")[-1]
-            return await self._download_via_ytdlp(f"ytsearch1:{track_id}", output_template)
+            fallback = self._fallback_query(original_title, original_artist)
+            return await self._download_via_ytdlp(f"ytsearch3:{fallback}", output_template)
 
     async def _download_via_ytdlp(
         self, query: str, output_template: str,
@@ -437,6 +448,13 @@ class MusicDownloader:
             return None, "下载超时，请检查网络"
         except Exception as e:
             return None, f"下载异常: {e}"
+
+    @staticmethod
+    def _fallback_query(title: str, artist: str) -> str:
+        """Build a clean search query from original title and artist."""
+        query = f"{title} {artist}".strip()
+        query = re.sub(r'[<>|"&!$`]', "", query).strip()
+        return query or "unknown"
 
     @staticmethod
     def _find_python() -> Optional[str]:
