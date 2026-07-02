@@ -312,16 +312,29 @@ class MusicDownloader:
                 cand.spotify_url, output_template, download_dir,
             )
 
-        # Candidate with YouTube ID → direct yt-dlp download
+        # Try direct YouTube ID download first
         if cand.yt_id:
             if cand.source == "spotdl":
                 query = f"https://music.youtube.com/watch?v={cand.yt_id}"
             else:
                 query = f"https://www.youtube.com/watch?v={cand.yt_id}"
-        else:
-            query = f"ytsearch1:{cand.title}"
 
-        return await self._download_via_ytdlp(query, output_template)
+            filepath, err = await self._download_via_ytdlp(query, output_template)
+            if filepath:
+                return filepath, ""
+
+            # Direct ID failed (deleted/restricted video) → fallback to search
+            logger.info(
+                f"[MusicShare] ID download failed ({err[:60]}), "
+                f"retrying with ytsearch1:{cand.title[:40]}"
+            )
+
+        # Last resort: search by title
+        query = f"ytsearch1:{cand.title}"
+        filepath, err = await self._download_via_ytdlp(query, output_template)
+        if filepath:
+            return filepath, ""
+        return None, err or "下载失败"
 
     async def _download_via_spotdl(
         self, spotify_url: str, output_template: str, download_dir: Path,
