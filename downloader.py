@@ -1,4 +1,4 @@
-"""Dual-engine music search & download wrapper (yt-dlp + spotipy/spotdl)."""
+"""Dual-engine music search & download wrapper (yt-dlp + spotdl)."""
 import asyncio, json, os, re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,30 +19,6 @@ class Candidate:
 class MusicDownloader:
     def __init__(self, config: ConfigHelper):
         self.config = config
-        self._spotipy = None
-
-    def _get_spotipy(self):
-        """Lazy-init spotipy client with ClientCredentials (no browser OAuth)."""
-        if self._spotipy is not None:
-            return self._spotipy
-        client_id = self.config.spotify_client_id()
-        client_secret = self.config.spotify_client_secret()
-        if not client_id or not client_secret:
-            return None
-        try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyClientCredentials
-            cc = SpotifyClientCredentials(
-                client_id=client_id, client_secret=client_secret,
-            )
-            self._spotipy = spotipy.Spotify(client_credentials_manager=cc)
-            return self._spotipy
-        except ImportError:
-            logger.warning("[MusicShare] spotipy not installed, Spotify search disabled")
-            return None
-        except Exception as e:
-            logger.warning(f"[MusicShare] spotipy init failed: {e}")
-            return None
 
     async def search_and_download(
         self, title: str, artist: str,
@@ -66,10 +42,8 @@ class MusicDownloader:
             return None, f"未搜到匹配结果: {query}"
 
         if llm_picker is not None:
-            # LLM smart selection: let LLM pick the best match from candidates
             best = await llm_picker(candidates, title, artist)
             if best is None:
-                # LLM failed, fall back to scoring
                 best = self._pick_best(candidates, expected_secs, match_threshold, title)
             else:
                 logger.info(
@@ -93,18 +67,18 @@ class MusicDownloader:
         return filepath, ""
 
     async def _search_meta(self, query: str) -> Tuple[List[Candidate], List[str]]:
-        """双引擎竞速搜索：yt-dlp 必须完成，spotipy 作为补充最多额外等 5 秒。
+        """双引擎竞速搜索：yt-dlp 必须完成，spotdl 作为补充最多额外等 10 秒。
 
-        yt-dlp 先返回 → 单引擎候选用；spotipy 在 5 秒内也返回 → 合并提高匹配精度。
-        spotipy 是纯 HTTP API 调用，通常 <1 秒完成，超时或失败不阻塞整体流程。
+        yt-dlp 先返回 → 单引擎候选用；spotdl 在 10 秒内也返回 → 合并提高匹配精度。
+        spotdl 超时或失败不阻塞整体流程。
         """
-        SPOTIPY_GRACE_SECS = 5
+        SPOTDL_GRACE_SECS = 10
 
         candidates: List[Candidate] = []
         errors: List[str] = []
 
         ytdlp_task = asyncio.create_task(self._ytdlp_search(query))
-        spotipy_task = asyncio.create_task(self._spotipy_search(query))
+        spotdl_task = asyncio.create_task(self._spotdl_search(query))
 
         # 1) 等 yt-dlp（使用用户配置的 search_timeout，必须完成）
         try:
@@ -115,44 +89,117 @@ class MusicDownloader:
             errors.append(f"yt-dlp: {e}")
             logger.warning(f"[MusicShare] yt-dlp search error: {e}")
 
-        # 2) yt-dlp 完成后，spotipy 可能：已完成 / 还在跑 / 已抛异常
-        if spotipy_task.done():
+        # 2) yt-dlp 完成后，spotdl 可能：已完成 / 还在跑 / 已抛异常
+        if spotdl_task.done():
             try:
-                spotipy_result = spotipy_task.result()
-                if spotipy_result:
-                    candidates.extend(spotipy_result)
+                spotdl_result = spotdl_task.result()
+                if spotdl_result:
+                    candidates.extend(spotdl_result)
             except Exception as e:
-                errors.append(f"spotipy: {e}")
-                logger.warning(f"[MusicShare] spotipy search error: {e}")
+                errors.append(f"spotdl: {e}")
+                logger.warning(f"[MusicShare] spotdl search error: {e}")
         else:
             try:
-                spotipy_result = await asyncio.wait_for(
-                    spotipy_task, timeout=SPOTIPY_GRACE_SECS,
+                spotdl_result = await asyncio.wait_for(
+                    spotdl_task, timeout=SPOTDL_GRACE_SECS,
                 )
-                if spotipy_result:
-                    candidates.extend(spotipy_result)
+                if spotdl_result:
+                    candidates.extend(spotdl_result)
             except asyncio.TimeoutError:
-                spotipy_task.cancel()
+                spotdl_task.cancel()
                 try:
-                    await spotipy_task
+                    await spotdl_task
                 except (asyncio.CancelledError, Exception):
                     pass
                 logger.info(
-                    f"[MusicShare] spotipy 未在 {SPOTIPY_GRACE_SECS}s 内返回，"
+                    f"[MusicShare] spotdl 未在 {SPOTDL_GRACE_SECS}s 内返回，"
                     f"仅使用 yt-dlp 结果"
                 )
             except Exception as e:
-                errors.append(f"spotipy: {e}")
-                logger.warning(f"[MusicShare] spotipy search error: {e}")
+                errors.append(f"spotdl: {e}")
+                logger.warning(f"[MusicShare] spotdl search error: {e}")
 
         return candidates, errors
 
     async def _ytdlp_search(self, query: str) -> Optional[List[Candidate]]:
+        """Search YouTube via yt-dlp ytsearch.
+
+        Uses --ignore-no-formats-error to skip individual results that have
+        no available formats (deleted/restricted videos).  Even if yt-dlp
+        exits non-zero, we parse whatever JSON lines were successfully output.
+        """
         python_exe = self._find_python()
         if not python_exe: return None
         cmd = [python_exe, "-m", "yt_dlp", f"ytsearch3:{query}",
                "--dump-json", "--no-warnings", "--no-playlist",
-               "--skip-download", "--quiet"]
+               "--skip-download", "--quiet",
+               "--ignore-no-formats-error"]
+        proxy = self.config.proxy()
+        if proxy: cmd.extend(["--proxy", proxy])
+        try:
+            proc = await asyncio.create_subprocess_exec(*cmd,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self.config.search_timeout())
+            # Parse any JSON lines that were successfully output, even on error
+            candidates = []
+            output = stdout.decode("utf-8", errors="replace").strip()
+            for line in output.split("\n"):
+                if not line: continue
+                try:
+                    d = json.loads(line)
+                    dur = float(d.get("duration", 0) or 0)
+                    if dur <= 0:
+                        continue  # skip videos with no duration (live, deleted)
+                    candidates.append(Candidate(
+                        duration=dur,
+                        title=d.get("title", ""),
+                        source="yt-dlp", yt_id=d.get("id", "")))
+                except Exception:
+                    continue
+
+            if candidates:
+                return candidates
+
+            # No usable candidates – check if there was a hard error
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace")[:300]
+                if "bot" in err.lower() or "login" in err.lower():
+                    raise RuntimeError("YouTube 反爬拦截，请检查代理/网络")
+                if "timed out" in err.lower():
+                    raise asyncio.TimeoutError("搜索超时")
+                raise RuntimeError(f"yt-dlp 搜索失败: {err[:100]}")
+            return None
+        except asyncio.TimeoutError:
+            raise RuntimeError("YouTube 搜索超时，请检查网络或代理")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"yt-dlp 搜索异常: {e}")
+
+    async def _spotdl_search(self, query: str) -> Optional[List[Candidate]]:
+        """Search Spotify via spotdl save (subprocess).  Returns candidates with
+        Spotify metadata and YouTube IDs for download.
+
+        If spotdl times out or fails, this is handled gracefully by the race
+        logic in _search_meta – yt-dlp results are used instead.
+        """
+        client_id = self.config.spotify_client_id()
+        client_secret = self.config.spotify_client_secret()
+        if not client_id or not client_secret:
+            return None  # Silently skip – no credentials
+
+        python_exe = self._find_python()
+        if not python_exe: return None
+
+        self._ensure_spotdl_config(client_id, client_secret)
+
+        cmd = [
+            python_exe, "-m", "spotdl", "save", query, "--save-file", "-",
+            "--headless",
+            "--client-id", client_id,
+            "--client-secret", client_secret,
+        ]
         proxy = self.config.proxy()
         if proxy: cmd.extend(["--proxy", proxy])
         try:
@@ -161,12 +208,8 @@ class MusicDownloader:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.config.search_timeout())
             if proc.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace")[:300]
-                if "bot" in err.lower() or "login" in err.lower():
-                    raise RuntimeError("YouTube 反爬拦截，请检查代理/网络")
-                if "timed out" in err.lower():
-                    raise asyncio.TimeoutError("搜索超时")
-                raise RuntimeError(f"yt-dlp 搜索失败: {err[:100]}")
+                err = stderr.decode("utf-8", errors="replace")[:200]
+                raise RuntimeError(f"spotdl 搜索失败: {err[:80]}")
             candidates = []
             for line in stdout.decode("utf-8", errors="replace").strip().split("\n"):
                 if not line: continue
@@ -174,53 +217,41 @@ class MusicDownloader:
                     d = json.loads(line)
                     candidates.append(Candidate(
                         duration=float(d.get("duration", 0) or 0),
-                        title=d.get("title", ""),
-                        source="yt-dlp", yt_id=d.get("id", "")))
-                except: continue
+                        title=d.get("name", "") or d.get("title", ""),
+                        source="spotdl",
+                        yt_id=d.get("yt_id", "") or d.get("youtube_id", ""),
+                        spotify_url=d.get("url", "") or d.get("spotify_url", ""),
+                    ))
+                except Exception:
+                    continue
             return candidates or None
         except asyncio.TimeoutError:
-            raise RuntimeError("YouTube 搜索超时，请检查网络或代理")
+            raise RuntimeError("Spotify 搜索超时，请检查网络或代理")
         except RuntimeError:
             raise
         except Exception as e:
-            raise RuntimeError(f"yt-dlp 搜索异常: {e}")
+            raise RuntimeError(f"spotdl 搜索异常: {e}")
 
-    async def _spotipy_search(self, query: str) -> Optional[List[Candidate]]:
-        """Search Spotify via spotipy API (pure HTTP, no subprocess, <1s)."""
-        sp = self._get_spotipy()
-        if sp is None:
-            return None  # No credentials or import error, silently skip
-
-        try:
-            result = await asyncio.to_thread(
-                sp.search, q=query, type="track", limit=5,
-            )
-        except Exception as e:
-            raise RuntimeError(f"spotipy 搜索异常: {e}")
-
-        tracks = result.get("tracks", {}).get("items", [])
-        if not tracks:
-            return None
-
-        candidates = []
-        for t in tracks:
-            try:
-                duration_ms = t.get("duration_ms", 0) or 0
-                title = t.get("name", "")
-                artists = ", ".join(a["name"] for a in t.get("artists", []) if a.get("name"))
-                # Keep both title-only and "title - artists" for better matching
-                full_title = f"{title} - {artists}" if artists else title
-
-                candidates.append(Candidate(
-                    duration=round(duration_ms / 1000.0, 1),
-                    title=full_title,
-                    source="spotipy",
-                    spotify_url=t.get("external_urls", {}).get("spotify", ""),
-                ))
-            except Exception:
-                continue
-
-        return candidates or None
+    @staticmethod
+    def _ensure_spotdl_config(client_id: str, client_secret: str):
+        """Write ~/.spotdl/config.json with Spotify OAuth credentials."""
+        import os as _os_module, json as _json_module
+        _os_module.makedirs(_os_module.path.expanduser("~/.spotdl"), exist_ok=True)
+        _config_path = _os_module.path.expanduser("~/.spotdl/config.json")
+        _config = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_token": None,
+            "user_auth": False,
+            "headless": True,
+            "cache_path": _os_module.path.expanduser("~/.spotdl/.spotipy"),
+            "no_cache": False,
+            "max_retries": 3,
+            "use_cache_file": False,
+        }
+        with open(_config_path, "w") as f:
+            _json_module.dump(_config, f)
+        logger.debug(f"[MusicShare] spotdl config written to {_config_path}")
 
     @staticmethod
     def _parse_duration(dur: str) -> float:
@@ -255,7 +286,7 @@ class MusicDownloader:
                 dur_score = 0.5
             cand_title = cand.title.lower().strip()
             title_score = rfuzz.partial_ratio(clean_orig, cand_title) / 100.0
-            source_score = 0.8 if cand.source in ("spotipy", "spotdl") else 0.2
+            source_score = 0.8 if cand.source == "spotdl" else 0.2
             neg_penalty = 0.0
             if (not cls._NEGATIVE_KEYWORDS.search(clean_orig) and
                     cls._NEGATIVE_KEYWORDS.search(cand_title)):
@@ -265,23 +296,29 @@ class MusicDownloader:
         return best
 
     async def _download(self, cand: Candidate, download_dir: Path) -> Tuple[Optional[Path], str]:
+        """Download audio for a candidate.
+
+        - spotdl candidates with spotify_url: use spotdl download (best accuracy)
+        - spotdl/yt-dlp candidates with yt_id: use yt-dlp
+        - all others: use yt-dlp ytsearch
+        """
         output_template = str(download_dir / "%(title)s.%(ext)s")
         python_exe = self._find_python()
         if not python_exe: return None, "未找到 Python 解释器"
 
-        # spotipy (Spotify API) candidate: use spotdl download for best accuracy
-        if cand.source == "spotipy" and cand.spotify_url:
+        # spotdl candidate with Spotify URL → use spotdl for precise download
+        if cand.source == "spotdl" and cand.spotify_url:
             return await self._download_via_spotdl(
                 cand.spotify_url, output_template, download_dir,
             )
 
-        # yt-dlp candidate (or spotdl with yt_id): use yt-dlp
-        if cand.source == "spotdl" and cand.yt_id:
-            query = f"https://music.youtube.com/watch?v={cand.yt_id}"
-        elif cand.source == "yt-dlp" and cand.yt_id:
-            query = f"https://www.youtube.com/watch?v={cand.yt_id}"
+        # Candidate with YouTube ID → direct yt-dlp download
+        if cand.yt_id:
+            if cand.source == "spotdl":
+                query = f"https://music.youtube.com/watch?v={cand.yt_id}"
+            else:
+                query = f"https://www.youtube.com/watch?v={cand.yt_id}"
         else:
-            # spotipy without spotify_url – search yt by title
             query = f"ytsearch1:{cand.title}"
 
         return await self._download_via_ytdlp(query, output_template)
@@ -289,7 +326,7 @@ class MusicDownloader:
     async def _download_via_spotdl(
         self, spotify_url: str, output_template: str, download_dir: Path,
     ) -> Tuple[Optional[Path], str]:
-        """Download via spotdl from a Spotify URL."""
+        """Download via spotdl from a Spotify URL.  Falls back to yt-dlp on failure."""
         python_exe = self._find_python()
         if not python_exe: return None, "未找到 Python 解释器"
 
@@ -315,23 +352,15 @@ class MusicDownloader:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.config.search_timeout() * 3,
             )
-            if proc.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace")[:200]
-                logger.warning(
-                    f"[MusicShare] spotdl download failed, falling back to yt-dlp: {err[:100]}"
-                )
-                track_id = spotify_url.rstrip("/").split("/")[-1]
-                query = f"ytsearch1:{track_id}"
-                return await self._download_via_ytdlp(query, output_template)
-
-            # spotdl outputs to download_dir, find the downloaded file
             stdout_text = stdout.decode("utf-8", errors="replace").strip()
-            if stdout_text:
+            stderr_text = stderr.decode("utf-8", errors="replace")[:200]
+
+            if proc.returncode == 0 and stdout_text:
                 fp = Path(stdout_text.split("\n")[-1].strip())
                 if fp.exists():
                     return fp, ""
 
-            # Fallback: scan download_dir for recently created audio files
+            # Try scanning download_dir for the newest audio file
             try:
                 newest = max(
                     download_dir.glob(f"*.{self.config.audio_format()}"),
@@ -342,15 +371,22 @@ class MusicDownloader:
             except Exception:
                 pass
 
-            return None, "spotdl 下载完成但未找到文件"
+            # spotdl failed – fallback to yt-dlp
+            if stderr_text:
+                logger.warning(
+                    f"[MusicShare] spotdl download failed, fallback yt-dlp: {stderr_text[:100]}"
+                )
+            track_id = spotify_url.rstrip("/").split("/")[-1]
+            return await self._download_via_ytdlp(f"ytsearch1:{track_id}", output_template)
+
         except asyncio.TimeoutError:
-            logger.warning("[MusicShare] spotdl download timeout, falling back to yt-dlp")
-            query = f"ytsearch1:{spotify_url.split('/')[-1]}"
-            return await self._download_via_ytdlp(query, output_template)
+            logger.warning("[MusicShare] spotdl download timeout, fallback yt-dlp")
+            track_id = spotify_url.rstrip("/").split("/")[-1]
+            return await self._download_via_ytdlp(f"ytsearch1:{track_id}", output_template)
         except Exception as e:
-            logger.warning(f"[MusicShare] spotdl download error: {e}, falling back to yt-dlp")
-            query = f"ytsearch1:{spotify_url.split('/')[-1]}"
-            return await self._download_via_ytdlp(query, output_template)
+            logger.warning(f"[MusicShare] spotdl download error: {e}, fallback yt-dlp")
+            track_id = spotify_url.rstrip("/").split("/")[-1]
+            return await self._download_via_ytdlp(f"ytsearch1:{track_id}", output_template)
 
     async def _download_via_ytdlp(
         self, query: str, output_template: str,
@@ -365,6 +401,7 @@ class MusicDownloader:
                f"--audio-quality={self.config.audio_quality()}",
                "--max-filesize", f"{self.config.max_file_size_mb()}M",
                "--output", output_template, "--no-progress",
+               "--ignore-no-formats-error",
                "--print", "after_move:filepath"]
         proxy = self.config.proxy()
         if proxy: cmd.extend(["--proxy", proxy])

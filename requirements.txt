@@ -2,7 +2,6 @@ aiohttp>=3.8
 beautifulsoup4>=4.12
 Pillow>=10.0
 spotdl>=4.2,<4.5
-spotipy
 yt-dlp
 rapidfuzz>=3.0
 pyacrcloud>=1.0
