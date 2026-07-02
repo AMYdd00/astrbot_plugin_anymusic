@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## [1.0.5] - 2026-07-02
+
+### Removed
+- **完全移除 spotdl 依赖**：spotdl 搜索/下载 Spotify API 需要 Premium 订阅（403），从未能正常工作
+- 移除 `spotify_client_id` / `spotify_client_secret` 等 spotdl 相关配置项
+- 删除 `_ensure_spotdl_config`、`_spotdl_search`、双引擎竞速逻辑
+
+### Changed
+- **回归纯净 yt-dlp 架构**：搜索 `ytsearch3` → 匹配（LLM智能选歌/评分）→ 下载 `-x` 自动选编码
+- 下载命令从 `--extract-audio --audio-format=mp3` 改为 `-x`，让 yt-dlp 自动选最佳音频编码
+- 匹配评分简化为时长+标题 50:50（移除来源加权）
+
+### Fixed
+- 下载特定 YouTube ID 失败时自动 fallback 到 `ytsearch3:原始歌名+歌手` 搜索替代版本
+- yt-dlp 搜索/下载均加 `--ignore-no-formats-error`，跳过已删除/受限视频
+
+### Security
+- 移除 `spotdl>=4.2,<4.5` 依赖及其子进程调用，减少攻击面
+
 ## [1.0.4] - 2026-06-25
 
 ### Fixed

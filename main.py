@@ -40,7 +40,7 @@ from .utils import (
 )
 
 
-@register("astrbot_plugin_anymusic", "user", "AnyMusic", "1.0.4")
+@register("astrbot_plugin_anymusic", "user", "AnyMusic", "1.0.5")
 class MusicSharePlugin(Star):
     """Auto-detect music links & LLM song search / voice recognition tool."""
 

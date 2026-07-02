@@ -118,17 +118,5 @@
     "description": "ACRCloud Access Secret",
     "hint": "在 https://console.acrcloud.com 注册获取",
     "default": ""
-  },
-  "spotify_client_id": {
-    "type": "string",
-    "description": "Spotify Client ID",
-    "hint": "Spotify API 凭证，用于 spotdl 搜索。免费注册见 README。留空则跳过 spotdl 搜索。",
-    "default": ""
-  },
-  "spotify_client_secret": {
-    "type": "string",
-    "description": "Spotify Client Secret",
-    "hint": "Spotify API 凭证，免费注册见 README。留空则跳过 spotdl 搜索。",
-    "default": ""
   }
 }

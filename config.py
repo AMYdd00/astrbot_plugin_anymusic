@@ -77,8 +77,3 @@ class ConfigHelper:
     def acrcloud_access_secret(self) -> str:
         return str(self._cfg("acrcloud_access_secret", "") or "").strip()
 
-    def spotify_client_id(self) -> str:
-        return str(self._cfg("spotify_client_id", "") or "").strip()
-
-    def spotify_client_secret(self) -> str:
-        return str(self._cfg("spotify_client_secret", "") or "").strip()
