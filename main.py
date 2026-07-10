@@ -143,20 +143,8 @@ class MusicSharePlugin(Star):
                     except Exception as e:
                         logger.warning(f"[MusicShare] 缓存语音路径失败: {e}")
 
-        # ── Voice recognition: @bot + voice/reply-to-voice only ──
-        if self.config_helper.voice_recognition_enabled() and event.is_wake_up():
-            has_record = "[CQ:record" in raw
-            if not has_record:
-                has_record = self._extract_record_from_chain(event) is not None
-            has_reply_to_voice = (
-                not has_record
-                and self._extract_record_from_reply(event.message_obj) is not None
-            )
-            if has_record or has_reply_to_voice:
-                logger.info(f"[MusicShare] 检测到@bot+语音，进入识曲")
-                async for result in self._handle_voice_recognition(event):
-                    yield result
-                return
+        # ── Voice recognition: handled by LLM tool recognize_song ──
+        # (no hardcoded trigger — LLM judges user intent from message text)
 
         result = extract_music_url(message_text)
         if result is None:
